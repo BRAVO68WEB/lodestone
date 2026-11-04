@@ -53,6 +53,28 @@ impl UserPermission {
             can_install_extension: false,
         }
     }
+
+    /// Permissions that let a non-owner change the host or run code.
+    pub fn has_unsafe(&self) -> bool {
+        !self.can_write_instance_resource.is_empty()
+            || !self.can_access_instance_macro.is_empty()
+            || !self.can_write_instance_file.is_empty()
+            || self.can_read_global_file
+            || self.can_write_global_file
+            || self.can_manage_permission
+            || self.can_install_extension
+    }
+
+    /// Drop every grant that [`Self::has_unsafe`] reports.
+    pub fn strip_unsafe(&mut self) {
+        self.can_write_instance_resource.clear();
+        self.can_access_instance_macro.clear();
+        self.can_write_instance_file.clear();
+        self.can_read_global_file = false;
+        self.can_write_global_file = false;
+        self.can_manage_permission = false;
+        self.can_install_extension = false;
+    }
 }
 
 impl Default for UserPermission {

@@ -71,6 +71,14 @@ pub async fn change_core_safe_mode(
             source: eyre!("Not authorized to change core safe mode"),
         });
     }
+    if safe_mode {
+        state
+            .users_manager
+            .write()
+            .await
+            .strip_unsafe_permissions()
+            .await?;
+    }
     state
         .global_settings
         .lock()

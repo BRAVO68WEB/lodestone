@@ -4,7 +4,6 @@ use argon2::{Argon2, PasswordVerifier};
 use color_eyre::eyre::{eyre, Context};
 use jsonwebtoken::{Algorithm, Validation};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tracing::warn;
 use ts_rs::TS;
 
@@ -173,12 +172,34 @@ impl User {
             UserAction::ManageUser => self.is_owner,
             UserAction::ManagePermission => self.permissions.can_manage_permission,
             UserAction::InstallExtension => self.permissions.can_install_extension,
+            // Same gate as writing this instance's files. Safe mode still blocks non-owners
+            // because the action is unsafe.
+            UserAction::InstanceShell(instance_id) => {
+                self.permissions.can_write_global_file
+                    || self
+                        .permissions
+                        .can_write_instance_file
+                        .contains(instance_id)
+            }
         }
     }
 
+    /// Search results. `can_view_event` plus a view check when the event names an instance,
+    /// so a progression event for another instance is not returned to someone who cannot view it.
+    pub fn can_see_event(&self, event: impl AsRef<Event>) -> bool {
+        let event = event.as_ref();
+        if !self.can_view_event(event) {
+            return false;
+        }
+        if let Some(uuid) = event.get_instance_uuid() {
+            return self.can_perform_action(&UserAction::ViewInstance(uuid));
+        }
+        true
+    }
+
     pub fn try_action(&self, action: &UserAction, safe_mode: bool) -> Result<(), Error> {
-        if (action.is_safe() || (!action.is_safe() && !safe_mode))
-            && self.can_perform_action(action)
+        // Safe mode limits non-owners. The owner still manages users and other unsafe actions.
+        if self.is_owner || ((action.is_safe() || !safe_mode) && self.can_perform_action(action))
         {
             Ok(())
         } else {
@@ -234,6 +255,9 @@ impl User {
                     UserAction::InstallExtension => {
                         eyre!("You don't have permission to install extension")
                     }
+                    UserAction::InstanceShell(_) => {
+                        eyre!("You don't have permission to run a shell command on this instance")
+                    }
                 },
             })
         }
@@ -281,6 +305,8 @@ pub enum UserAction {
     AccessMacro(Option<InstanceUuid>),
     ReadInstanceFile(InstanceUuid),
     WriteInstanceFile(InstanceUuid),
+    /// Run an allowlisted command in the instance directory. Unsafe.
+    InstanceShell(InstanceUuid),
 
     // global actions:
     CreateInstance,
@@ -301,10 +327,11 @@ impl UserAction {
             UserAction::AccessConsole(_) => true,
             UserAction::AccessSetting(_) => true,
             UserAction::ReadResource(_) => true,
-            UserAction::WriteResource(_) => true,
-            UserAction::AccessMacro(_) => true,
+            UserAction::WriteResource(_) => false,
+            UserAction::AccessMacro(_) => false,
             UserAction::ReadInstanceFile(_) => true,
-            UserAction::WriteInstanceFile(_) => true,
+            UserAction::WriteInstanceFile(_) => false,
+            UserAction::InstanceShell(_) => false,
             UserAction::CreateInstance => true,
             UserAction::DeleteInstance => true,
             UserAction::ReadGlobalFile => false,
@@ -409,21 +436,10 @@ impl UsersManager {
     }
 
     async fn write_to_file(&self) -> Result<(), Error> {
-        let mut file = tokio::fs::File::create(&self.path_to_users)
-            .await
-            .context(format!(
-                "Failed to open/create json file {}",
-                &self.path_to_users.display()
-            ))?;
-
-        file.write_all(
-            serde_json::to_string(&self.users)
-                .context("Failed to deserialize user json")?
-                .as_bytes(),
-        )
-        .await
-        .context("Failed to write to user json".to_string())?;
-        Ok(())
+        let bytes = serde_json::to_string(&self.users)
+            .context("Failed to serialize user json")?
+            .into_bytes();
+        crate::util::write_atomic(&self.path_to_users, &bytes).await
     }
     pub fn get_user(&self, uid: impl AsRef<UserId>) -> Option<User> {
         self.users.get(uid.as_ref()).cloned()
@@ -674,6 +690,48 @@ impl UsersManager {
         }
     }
 
+    /// Remove unsafe grants from every non-owner and persist `users.json`.
+    /// Owners keep their access through the owner short-circuit, not these bits.
+    pub async fn strip_unsafe_permissions(&mut self) -> Result<usize, Error> {
+        let mut previous: Vec<(UserId, UserPermission)> = Vec::new();
+        for user in self.users.values_mut() {
+            if user.is_owner || !user.permissions.has_unsafe() {
+                continue;
+            }
+            previous.push((user.uid.clone(), user.permissions.clone()));
+            user.permissions.strip_unsafe();
+        }
+        if previous.is_empty() {
+            return Ok(0);
+        }
+        if let Err(err) = self.write_to_file().await {
+            for (uid, permissions) in previous {
+                if let Some(user) = self.users.get_mut(&uid) {
+                    user.permissions = permissions;
+                }
+            }
+            return Err(err);
+        }
+        let count = previous.len();
+        for (uid, _) in previous {
+            let Some(permissions) = self.users.get(&uid).map(|user| user.permissions.clone()) else {
+                continue;
+            };
+            self.event_broadcaster.send(Event {
+                event_inner: EventInner::UserEvent(UserEvent {
+                    user_id: uid,
+                    user_event_inner: UserEventInner::PermissionChanged {
+                        new_permissions: Box::new(permissions),
+                    },
+                }),
+                details: "Safe mode removed unsafe permissions".to_string(),
+                snowflake: Snowflake::default(),
+                caused_by: CausedBy::System,
+            });
+        }
+        Ok(count)
+    }
+
     pub fn try_auth(&self, token: &str) -> Option<User> {
         let claimed_uid = decode_no_verify(token)?;
         let claimed_requester = self.users.get(&claimed_uid)?;
@@ -744,6 +802,133 @@ impl AsRef<HashMap<UserId, User>> for UsersManager {
 }
 
 mod tests {
+
+    #[test]
+    fn owner_can_manage_users_in_safe_mode() {
+        use super::*;
+        let owner = User::new(
+            "owner".to_string(),
+            "12345",
+            true,
+            false,
+            UserPermission::default(),
+        );
+        assert!(owner.try_action(&UserAction::ManageUser, true).is_ok());
+
+        let user = User::new(
+            "user".to_string(),
+            "12345",
+            false,
+            false,
+            UserPermission::default(),
+        );
+        assert!(user.try_action(&UserAction::ManageUser, true).is_err());
+        assert!(user.try_action(&UserAction::ManageUser, false).is_err());
+    }
+
+    #[test]
+    fn shell_is_blocked_for_non_owner_in_safe_mode() {
+        use super::*;
+        let uuid = InstanceUuid::from("INSTANCE_a".to_string());
+        let mut permissions = UserPermission::default();
+        permissions.can_write_instance_file.insert(uuid.clone());
+        permissions.can_read_instance_file.insert(uuid.clone());
+        permissions.can_view_instance.insert(uuid.clone());
+        let user = User::new("user".to_string(), "12345", false, false, permissions);
+        assert!(user
+            .try_action(&UserAction::InstanceShell(uuid.clone()), true)
+            .is_err());
+        assert!(user
+            .try_action(&UserAction::InstanceShell(uuid.clone()), false)
+            .is_ok());
+
+        let owner = User::new(
+            "owner".to_string(),
+            "12345",
+            true,
+            false,
+            UserPermission::default(),
+        );
+        assert!(owner
+            .try_action(&UserAction::InstanceShell(uuid.clone()), true)
+            .is_ok());
+
+        let stranger = User::new(
+            "stranger".to_string(),
+            "12345",
+            false,
+            false,
+            UserPermission::default(),
+        );
+        assert!(stranger
+            .try_action(&UserAction::InstanceShell(uuid.clone()), false)
+            .is_err());
+        assert!(user
+            .try_action(&UserAction::WriteInstanceFile(uuid.clone()), true)
+            .is_err());
+        assert!(user
+            .try_action(&UserAction::WriteInstanceFile(uuid.clone()), false)
+            .is_ok());
+        assert!(user
+            .try_action(&UserAction::ReadInstanceFile(uuid), true)
+            .is_ok());
+    }
+
+    #[test]
+    fn strip_unsafe_clears_file_write_and_global_read() {
+        use super::*;
+        let uuid = InstanceUuid::from("INSTANCE_a".to_string());
+        let mut permissions = UserPermission::default();
+        permissions.can_write_instance_file.insert(uuid.clone());
+        permissions.can_read_global_file = true;
+        permissions.can_view_instance.insert(uuid.clone());
+        permissions.can_install_extension = true;
+        assert!(permissions.has_unsafe());
+        permissions.strip_unsafe();
+        assert!(!permissions.has_unsafe());
+        assert!(permissions.can_write_instance_file.is_empty());
+        assert!(!permissions.can_read_global_file);
+        assert!(!permissions.can_install_extension);
+        assert!(permissions.can_view_instance.contains(&uuid));
+    }
+
+    #[test]
+    fn non_owner_cannot_see_another_instances_events() {
+        use super::*;
+        use crate::events::{Event, EventInner, FSEvent, FSOperation, FSTarget, InstanceEvent, InstanceEventInner};
+        use crate::traits::t_server::State;
+        use std::path::PathBuf;
+
+        let allowed = InstanceUuid::from("INSTANCE_a".to_string());
+        let other = InstanceUuid::from("INSTANCE_b".to_string());
+        let mut permissions = UserPermission::default();
+        permissions.can_view_instance.insert(allowed.clone());
+        let user = User::new("user".to_string(), "12345", false, false, permissions);
+
+        let state = |uuid: InstanceUuid| Event {
+            event_inner: EventInner::InstanceEvent(InstanceEvent {
+                instance_uuid: uuid,
+                instance_name: "n".to_string(),
+                instance_event_inner: InstanceEventInner::StateTransition { to: State::Running },
+            }),
+            details: String::new(),
+            snowflake: Snowflake::default(),
+            caused_by: CausedBy::System,
+        };
+        assert!(user.can_see_event(&state(allowed)));
+        assert!(!user.can_see_event(&state(other)));
+
+        let fs = Event {
+            event_inner: EventInner::FSEvent(FSEvent {
+                operation: FSOperation::Read,
+                target: FSTarget::File(PathBuf::from("secret")),
+            }),
+            details: String::new(),
+            snowflake: Snowflake::default(),
+            caused_by: CausedBy::System,
+        };
+        assert!(!user.can_see_event(&fs));
+    }
 
     #[tokio::test]
     async fn test_login() {

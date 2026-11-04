@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::Context;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use ts_rs::TS;
 
 use crate::{error::Error, event_broadcaster::EventBroadcaster};
@@ -84,23 +83,10 @@ impl GlobalSettings {
         Ok(())
     }
     async fn write_to_file(&self) -> Result<(), Error> {
-        let mut file = tokio::fs::File::create(&self.path_to_global_settings)
-            .await
-            .context(format!(
-                "Failed to create global settings file at {}",
-                self.path_to_global_settings.display()
-            ))?;
-        file.write_all(
-            serde_json::to_string_pretty(&self.global_settings_data)
-                .context("Failed to serialize global settings data")?
-                .as_bytes(),
-        )
-        .await
-        .context(format!(
-            "Failed to write to global settings file at {}",
-            self.path_to_global_settings.display()
-        ))?;
-        Ok(())
+        let bytes = serde_json::to_string_pretty(&self.global_settings_data)
+            .context("Failed to serialize global settings data")?
+            .into_bytes();
+        crate::util::write_atomic(&self.path_to_global_settings, &bytes).await
     }
     pub async fn set_core_name(&mut self, name: String) -> Result<(), Error> {
         let old_name = self.global_settings_data.core_name.clone();

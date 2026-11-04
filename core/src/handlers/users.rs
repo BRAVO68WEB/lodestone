@@ -122,10 +122,12 @@ pub async fn update_permissions(
     let mut users_manager = state.users_manager.write().await;
 
     let requester = users_manager.try_auth_or_err(&token)?;
-    requester.try_action(
-        &UserAction::ManagePermission,
-        state.global_settings.lock().await.safe_mode(),
-    )?;
+    let safe_mode = state.global_settings.lock().await.safe_mode();
+    requester.try_action(&UserAction::ManagePermission, safe_mode)?;
+    let mut new_permissions = new_permissions;
+    if safe_mode {
+        new_permissions.strip_unsafe();
+    }
     let caused_by = CausedBy::User {
         user_id: requester.uid.clone(),
         user_name: requester.username.clone(),
