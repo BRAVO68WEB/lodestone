@@ -120,7 +120,7 @@ jobs:
           echo "::debug::$(ls)"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{env.FILENAME}}
           path: ./${{env.FILENAME}}

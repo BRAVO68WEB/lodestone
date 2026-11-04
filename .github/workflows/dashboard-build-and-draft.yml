@@ -105,7 +105,7 @@ jobs:
       # note linux has lowercase l, windows has uppercase L
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}-tauri
           path: "${{ join(fromJson(steps.tauri.outputs.artifactPaths), '\n') }}\n./src-tauri/target/release/Lodestone.exe\n./src-tauri/target/debug/Lodestone.exe"
