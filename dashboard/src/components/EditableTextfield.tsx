@@ -42,15 +42,21 @@ export default function EditableTextfield({
   };
 
   const onSave = async () => {
-    setIsLoading(true);
     const trimmed = editText.trim();
     setEditText(trimmed);
+    if (trimmed === displayText.trim()) {
+      setIsEditing(false);
+      setError('');
+      return;
+    }
     setIsLoading(true);
     const error = await catchAsyncToString(onSubmitProp(trimmed));
-    console.log(error);
     setError(error);
     setIsLoading(false);
-    if (!error) setDisplayText(trimmed);
+    if (!error) {
+      setDisplayText(trimmed);
+      setIsEditing(false);
+    }
   };
 
   const onCancel = () => {

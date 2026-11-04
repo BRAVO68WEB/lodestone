@@ -7,14 +7,15 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 export type InputFieldProps = FieldHookConfig<string> & {
   label?: string;
   type?: 'text' | 'number' | 'password';
+  hint?: string;
 };
 
 /**
  * A form input field, meant to be used with Formik
  */
 export default function InputField(props: InputFieldProps) {
-  const { className, label, type, disabled, ...rest } = props;
-  const [field, meta] = useField(props);
+  const { className, label, type, disabled, hint, ...fieldProps } = props;
+  const [field, meta] = useField(fieldProps);
   const isError = meta.touched && meta.error && true;
   const errorText = isError ? meta.error : '';
 
@@ -68,6 +69,7 @@ export default function InputField(props: InputFieldProps) {
             {errorText || 'Unknown error'}
           </div>
         )}
+        {hint && <p className="mt-2 text-small text-white/50">{hint}</p>}
       </div>
     </div>
   );

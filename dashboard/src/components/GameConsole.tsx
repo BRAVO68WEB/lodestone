@@ -8,14 +8,16 @@ import { useUserAuthorized } from 'data/UserInfo';
 import Tooltip from 'rc-tooltip';
 import { useContext, useEffect } from 'react';
 import { useRef, useState } from 'react';
-import { useLocalStorageQueryParam, usePrevious } from 'utils/hooks';
-import { DISABLE_AUTOFILL } from 'utils/util';
+import { DISABLE_AUTOFILL, errorToString } from 'utils/util';
+import { renderConsoleText } from 'utils/ansi';
 import ErrorGraphic from './ErrorGraphic';
 import { useDocumentTitle } from 'usehooks-ts';
 import Button from './Atoms/Button';
 import Checkbox from './Atoms/Checkbox';
+import { toast } from 'react-toastify';
 
 const autoScrollThreshold = 10;
+const consoleWindow = 300;
 
 export default function GameConsole() {
   useDocumentTitle('Instance Console - Lodestone');
@@ -31,7 +33,7 @@ export default function GameConsole() {
     "SystemMessage": true, 
     "InstanceOutput": true
   }
-  const { consoleLog, consoleStatus, clearConsoleLog } = useConsoleStream(uuid);
+  const { consoleLog, consoleStatus, clearConsoleLog, loadOlder } = useConsoleStream(uuid);
   const [command, setCommand] = useState('');
   const [filter, setFilter] = useState('');
   const [regex, setRegex] = useState(true);
@@ -39,14 +41,16 @@ export default function GameConsole() {
     CommandHistoryContext
   );
   const [commandNav, setCommandNav] = useState(commandHistory.length);
+  const [shownLines, setShownLines] = useState(consoleWindow);
+  const [historyExhausted, setHistoryExhausted] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const listRef = useRef<HTMLOListElement>(null);
-  const isAtBottom = listRef.current
-    ? listRef.current.scrollHeight -
-        listRef.current.scrollTop -
-        listRef.current.clientHeight <
-      autoScrollThreshold
-    : false;
-  const oldIsAtBottom = usePrevious(isAtBottom);
+  const pinnedToBottom = useRef(true);
+
+  useEffect(() => {
+    setShownLines(consoleWindow);
+    setHistoryExhausted(false);
+  }, [uuid]);
 
   const scrollToBottom = () => {
     if (listRef.current) {
@@ -54,12 +58,30 @@ export default function GameConsole() {
     }
   };
 
-  // if the user is already at the bottom of the list, scroll to the bottom when new items are added
-  // otherwise, don't scroll
+  const onConsoleScroll = () => {
+    const list = listRef.current;
+    if (!list) return;
+    pinnedToBottom.current =
+      list.scrollHeight - list.scrollTop - list.clientHeight <
+      autoScrollThreshold;
+  };
+
+  // Open on the latest line. Keep following new lines only while the user
+  // has not scrolled up.
   useEffect(() => {
-    if (oldIsAtBottom) scrollToBottom();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (pinnedToBottom.current) scrollToBottom();
   }, [consoleLog]);
+
+  const clearServerConsole = async () => {
+    try {
+      await axios.delete(`/instance/${uuid}/console/buffer`);
+      clearConsoleLog();
+      setShownLines(consoleWindow);
+      setHistoryExhausted(true);
+    } catch (err) {
+      toast.error(errorToString(err));
+    }
+  };
 
   const sendCommand = (command: string) => {
     axios({
@@ -156,18 +178,41 @@ export default function GameConsole() {
   setRegex(checked)
   }
 
+  const filteredLog = consoleLog.filter(filterMessage);
+  const hiddenLines = Math.max(0, filteredLog.length - shownLines);
+  const visibleLog = filteredLog.slice(hiddenLines);
+  const canShowOlder = hiddenLines > 0 || (!historyExhausted && consoleLog.length > 0);
+
+  const showOlder = async () => {
+    pinnedToBottom.current = false;
+    if (hiddenLines > 0) {
+      setShownLines((count) => count + consoleWindow);
+      return;
+    }
+    if (historyExhausted || loadingOlder || consoleLog.length === 0) return;
+    const list = listRef.current;
+    const previousHeight = list?.scrollHeight ?? 0;
+    const previousTop = list?.scrollTop ?? 0;
+    setLoadingOlder(true);
+    try {
+      const page = await loadOlder(consoleLog[0].snowflake);
+      if (page.exhausted || page.added === 0) setHistoryExhausted(true);
+      setShownLines((count) => count + Math.max(page.added, 1));
+      requestAnimationFrame(() => {
+        const node = listRef.current;
+        if (!node) return;
+        node.scrollTop = previousTop + (node.scrollHeight - previousHeight);
+      });
+    } catch (err) {
+      toast.error(errorToString(err));
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+
   return (
     <div className="relative flex h-full w-full grow flex-col pt-0">
-      {/* <div className="flex flex-row mb-3 justify-between">
-        <Button
-            align="start"
-            labelGrow={true}
-            label="clear console"
-            onClick={() => clearConsoleLog()}
-            disabled={false}
-        />
-      </div> */}
-      <div className="font-mono text-small mb-3 flex flex-row w-full justify-between">
+      <div className="mb-3 flex w-full flex-row items-center justify-between gap-2 font-mono text-small">
             <input
               className="w-full rounded-lg bg-gray-850 py-1 px-4 text-gray-300 outline-white/50 placeholder:text-gray-500 focus-visible:outline focus:outline-none disabled:placeholder:text-gray-500"
               placeholder={'Search console...'}
@@ -177,6 +222,7 @@ export default function GameConsole() {
               type="text"
             />
           <Checkbox label='Regex' checked={regex} onChange={checkRegex} className="ml-3"/>
+          <Button label="Clear" intention="info" onClick={clearServerConsole} />
       </div>
       <div className="relative flex h-full w-full grow flex-col rounded-lg border border-gray-faded/30">
         <Tooltip
@@ -211,16 +257,34 @@ export default function GameConsole() {
           <ol
             className="font-light flex h-0 grow rounded-t-lg flex-col overflow-y-auto whitespace-pre-wrap break-words border-b border-gray-faded/30 bg-gray-900 py-3 font-mono text-small tracking-tight text-gray-300"
             ref={listRef}
+            onScroll={onConsoleScroll}
           >
-            {consoleLog.map((line) => {
-              return filterMessage(line) ?
+            {canShowOlder && (
+              <li className="px-4 py-1">
+                <button
+                  type="button"
+                  className="text-blue-200 hover:underline"
+                  disabled={loadingOlder}
+                  onClick={() => {
+                    void showOlder();
+                  }}
+                >
+                  {loadingOlder
+                    ? 'Loading older...'
+                    : hiddenLines > 0
+                    ? `Show older (${hiddenLines})`
+                    : 'Show older'}
+                </button>
+              </li>
+            )}
+            {visibleLog.map((line) => (
               <li
                 key={line.snowflake}
                 className="py-[0.125rem] px-4 hover:bg-gray-800"
               >
-                {line.message}
-              </li> : <li></li>
-            })}
+                {renderConsoleText(line.message)}
+              </li>
+            ))}
           </ol>
         )}
         <div className="font-mono text-small">

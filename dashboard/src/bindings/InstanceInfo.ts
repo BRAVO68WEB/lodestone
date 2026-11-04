@@ -19,4 +19,5 @@ export interface InstanceInfo {
   player_count: number | null;
   max_player_count: number | null;
   player_list: Array<Player> | null;
+  folder: string;
 }

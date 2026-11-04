@@ -6,7 +6,7 @@ import ToggleBox from 'components/Atoms/Config/ToggleBox';
 import ConfirmDialog from 'components/Atoms/ConfirmDialog';
 import { useGlobalSettings } from 'data/GlobalSettings';
 import { LodestoneContext } from 'data/LodestoneContext';
-import { useCoreInfo } from 'data/SystemInfo';
+import { useCoreInfo, useDiskInfo } from 'data/SystemInfo';
 import { useUserInfo } from 'data/UserInfo';
 import { Form, Formik, FormikHelpers } from 'formik';
 import { useContext, useState } from 'react';
@@ -29,6 +29,7 @@ export const CoreSettings = () => {
   const queryClient = useQueryClient();
   const { data: globalSettings, isLoading, error } = useGlobalSettings();
   const { data: coreInfo } = useCoreInfo();
+  const { data: diskInfo } = useDiskInfo();
   const { data: userInfo } = useUserInfo();
   const can_change_core_settings = userInfo?.is_owner ?? false;
   const [showSafemodeDialog, setShowSafemodeDialog] = useState(false);
@@ -109,7 +110,7 @@ export const CoreSettings = () => {
       disabled={!can_change_core_settings}
       canRead={userInfo !== undefined}
       description={
-        'Attempts to prevent non-owner users from accessing adminstrative permissions on your machine'
+        'Blocks other users from reading the host filesystem, changing instance files, or running macros. Turning it on removes those permissions. Turning it off does not put them back.'
       }
       onChange={async (value) => {
         if (value) {
@@ -118,6 +119,7 @@ export const CoreSettings = () => {
             ...globalSettings,
             safe_mode: value,
           });
+          queryClient.invalidateQueries(['user', 'list']);
         } else {
           setShowSafemodeDialog(true);
         }
@@ -239,9 +241,10 @@ export const CoreSettings = () => {
       closeButtonText="Cancel"
       type={'info'}
     >
-      Are you sure you want to turn off safe mode? This will allow you to give
-      users other than yourself the ability to run potentially dangerous
-      commands. Make sure you trust all the users you give these permissions to.
+      Are you sure you want to turn off safe mode? Other users can then be
+      granted host file access, instance file writes, and macros. Permissions
+      removed when safe mode was turned on are not restored. Grant them again
+      only for people you trust.
     </ConfirmDialog>
   );
 
@@ -350,8 +353,10 @@ export const CoreSettings = () => {
   );
 
   function formatRamSize(totalRam?: number): string {
-    if (!totalRam) return "No ram? How are you running lodestone?";
-    const exponent = Math.floor(Math.log2(totalRam) / 10);
+    if (totalRam == null || Number.isNaN(totalRam))
+      return 'No ram? How are you running lodestone?';
+    if (totalRam <= 0) return '0 B';
+    const exponent = Math.min(Math.floor(Math.log2(totalRam) / 10), 4);
     const size = (totalRam / Math.pow(1024, exponent)).toFixed(2);
     const unit = ['B', 'KB', 'MB', 'GB', 'TB'][exponent];
     return `${size} ${unit}`;
@@ -363,6 +368,21 @@ export const CoreSettings = () => {
         <label className="text-medium font-medium text-gray-300">
           {/* This should be a function but i want to keep it small */}
           Total RAM: {formatRamSize(coreInfo?.total_ram)}
+        </label>
+      </div>
+    </div>
+  );
+
+  const diskField = (
+    <div className="relative flex flex-row items-center justify-between gap-4 bg-gray-800 px-4 py-3 text-h3">
+      <div className="flex min-w-0 grow flex-col">
+        <label className="text-medium font-medium text-gray-300">
+          Host disk:{' '}
+          {diskInfo
+            ? `${formatRamSize(diskInfo.total)} total, ${formatRamSize(
+                diskInfo.free
+              )} free`
+            : 'unavailable'}
         </label>
       </div>
     </div>
@@ -419,6 +439,7 @@ export const CoreSettings = () => {
               {cpuField}
               {cpuCountField}
               {ramField}
+              {diskField}
             </div>
           </div>
         </div>

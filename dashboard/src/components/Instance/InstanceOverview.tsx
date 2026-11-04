@@ -1,15 +1,21 @@
 import ClipboardTextfield from 'components/ClipboardTextfield';
+import Button from 'components/Atoms/Button';
 import Label from 'components/Atoms/Label';
+import ToggleBox from 'components/Atoms/Config/ToggleBox';
+import InputBox from 'components/Atoms/Config/InputBox';
 import { updateInstance } from 'data/InstanceList';
 import { LodestoneContext } from 'data/LodestoneContext';
-import { useContext } from 'react';
-import { axiosPutSingleValue, stateToLabelColor } from 'utils/util';
+import { useContext, useState } from 'react';
+import axios from 'axios';
+import { axiosPutSingleValue, errorToString, stateToLabelColor } from 'utils/util';
 import EditableTextfield from 'components/EditableTextfield';
 import { useQueryClient } from '@tanstack/react-query';
 import InstancePerformance from 'components/Instance/InstancePerformance';
 import { InstanceContext } from 'data/InstanceContext';
 import GameIcon from 'components/Atoms/GameIcon';
 import { useGlobalSettings } from 'data/GlobalSettings';
+import { useUserAuthorized } from 'data/UserInfo';
+import { toast } from 'react-toastify';
 
 import { useDocumentTitle } from 'usehooks-ts';
 import InstancePlayerList from './InstancePlayerList';
@@ -23,6 +29,11 @@ const InstanceOverview = () => {
   const domain = (globalSettings?.domain ?? address) || 'localhost';
   const queryClient = useQueryClient();
   const uuid = instance?.uuid;
+  const canChangeSettings = useUserAuthorized(
+    'can_access_instance_setting',
+    uuid ?? ''
+  );
+  const [powerLoading, setPowerLoading] = useState(false);
 
   if (!instance || !uuid) {
     return (
@@ -64,6 +75,52 @@ const InstanceOverview = () => {
     }));
   };
 
+  const setInstanceFolder = async (folder: string) => {
+    const trimmed = folder.trim();
+    await axiosPutSingleValue<void>(`/instance/${uuid}/folder`, trimmed);
+    updateInstance(uuid, queryClient, (oldData) => ({
+      ...oldData,
+      folder: trimmed,
+    }));
+  };
+
+  const setInstanceFlag = async (
+    path: 'auto_start' | 'restart_on_crash',
+    value: boolean
+  ) => {
+    await axiosPutSingleValue<void>(`/instance/${uuid}/${path}`, value);
+    updateInstance(uuid, queryClient, (oldData) => ({
+      ...oldData,
+      [path]: value,
+    }));
+  };
+
+  const powerLabel =
+    instance.state === 'Running'
+      ? 'Stop'
+      : instance.state === 'Starting'
+        ? 'Starting'
+        : instance.state === 'Stopping'
+          ? 'Stopping'
+          : 'Start';
+  const powerDisabled =
+    powerLoading ||
+    instance.state === 'Starting' ||
+    instance.state === 'Stopping';
+
+  const sendPower = async () => {
+    if (instance.state === 'Starting' || instance.state === 'Stopping') return;
+    const action = instance.state === 'Running' ? 'stop' : 'start';
+    setPowerLoading(true);
+    try {
+      await axios.put(`/instance/${uuid}/${action}`);
+    } catch (err) {
+      toast.error(errorToString(err));
+    } finally {
+      setPowerLoading(false);
+    }
+  };
+
   return (
     <>
       <div
@@ -86,6 +143,15 @@ const InstanceOverview = () => {
             <Label size="large" color={labelColor}>
               {instance.state}
             </Label>
+            <Button
+              label={powerLabel}
+              intention={instance.state === 'Running' ? 'danger' : 'info'}
+              disabled={powerDisabled}
+              loading={powerLoading}
+              onClick={() => {
+                void sendPower();
+              }}
+            />
             <Label size="large" color={'blue'}>
               Version {instance.version}
             </Label>
@@ -107,6 +173,29 @@ const InstanceOverview = () => {
               onSubmit={setInstanceDescription}
               placeholder="No description"
               containerClassName="min-w-0"
+            />
+          </div>
+          <div className="mt-2 flex w-full flex-col overflow-hidden rounded-lg border border-gray-faded/30 child:border-b child:border-gray-faded/30 last:child:border-b-0">
+            <InputBox
+              label="Folder"
+              value={instance.folder ?? ''}
+              canRead={canChangeSettings}
+              description="Groups this instance in the sidebar. Leave this empty to keep it with the other ungrouped instances."
+              onSubmit={setInstanceFolder}
+            />
+            <ToggleBox
+              label="Auto Start"
+              value={instance.auto_start}
+              canRead={canChangeSettings}
+              description="Start this instance when Lodestone Core starts."
+              onChange={(value) => setInstanceFlag('auto_start', value)}
+            />
+            <ToggleBox
+              label="Restart on Crash"
+              value={instance.restart_on_crash}
+              canRead={canChangeSettings}
+              description="The instance will restart automatically if it crashes."
+              onChange={(value) => setInstanceFlag('restart_on_crash', value)}
             />
           </div>
         </div>

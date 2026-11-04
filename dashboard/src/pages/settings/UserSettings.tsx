@@ -34,12 +34,6 @@ const NormalPermissions: {
     description: 'The user can delete any instance.',
   },
   {
-    permission: 'can_read_global_file' as keyof UserPermission,
-    title: 'Read Global Files',
-    description:
-      'The user can read any file on the computer Lodestone core is running on.',
-  },
-  {
     permission: 'can_view_instance' as keyof UserPermission,
     title: 'View Instances',
     description: 'The user can see these instances.',
@@ -79,11 +73,33 @@ const NormalPermissions: {
   },
 ];
 
+function withoutUnsafeGrants(
+  permissions: UserPermission,
+  safeMode: boolean
+): UserPermission {
+  if (!safeMode) return permissions;
+  return {
+    ...permissions,
+    can_read_global_file: false,
+    can_write_global_file: false,
+    can_manage_permission: false,
+    can_write_instance_file: [],
+    can_write_instance_resource: [],
+    can_access_instance_macro: [],
+  };
+}
+
 const UnsafePermissions: {
   permission: keyof UserPermission;
   title: string;
   description: string;
 }[] = [
+  {
+    permission: 'can_read_global_file' as keyof UserPermission,
+    title: 'Read Global Files',
+    description:
+      'The user can read any file on the computer Lodestone core is running on.',
+  },
   {
     permission: 'can_write_instance_resource' as keyof UserPermission,
     title: 'Modify Instance Resources',
@@ -246,10 +262,13 @@ export const UserSettings = () => {
                   onChange={(newSettings) => {
                     // I hate typescript
                     // |- me too
-                    const newPermissions = {
-                      ...selectedUser.permissions,
-                      [permission.permission]: newSettings,
-                    };
+                    const newPermissions = withoutUnsafeGrants(
+                      {
+                        ...selectedUser.permissions,
+                        [permission.permission]: newSettings,
+                      },
+                      globalSettings?.safe_mode || false
+                    );
                     changeUserPermissions(selectedUser.uid, newPermissions)
                       .then(() => {
                         updateCachedPermissions(
@@ -268,10 +287,13 @@ export const UserSettings = () => {
                 <Toggle
                   value={currentSettings}
                   onChange={(value: boolean) => {
-                    const newPermissions = {
-                      ...selectedUser.permissions,
-                      [permission.permission]: value,
-                    };
+                    const newPermissions = withoutUnsafeGrants(
+                      {
+                        ...selectedUser.permissions,
+                        [permission.permission]: value,
+                      },
+                      globalSettings?.safe_mode || false
+                    );
                     changeUserPermissions(selectedUser.uid, newPermissions)
                       .then(() => {
                         updateCachedPermissions(

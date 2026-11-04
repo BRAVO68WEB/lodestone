@@ -6,13 +6,12 @@ import { PublicUser } from 'bindings/PublicUser';
 import { useContext, useMemo } from 'react';
 import { LodestoneContext } from './LodestoneContext';
 import { UserPermission } from 'bindings/UserPermission';
-import { errorToString } from 'utils/util';
+import { coreSocket, errorToString } from 'utils/util';
 
 // this won't ever change. if it does it will be invalidated manually
 export const useUserInfo = (enabled = true) => {
   const { token, setToken, core } = useContext(LodestoneContext);
-  const { port, address } = core;
-  const socket = `${address}:${port}`;
+  const socket = coreSocket(core);
 
   return useQuery<PublicUser, AxiosError<ClientError>>(
     ['user', 'info'],

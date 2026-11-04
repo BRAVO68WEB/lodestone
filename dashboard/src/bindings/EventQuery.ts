@@ -16,4 +16,5 @@ export interface EventQuery {
   event_instance_ids: Array<InstanceUuid> | null;
   bearer_token: string | null;
   time_range: TimeRange | null;
+  exclude_console?: boolean | null;
 }

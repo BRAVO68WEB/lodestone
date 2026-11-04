@@ -61,6 +61,7 @@ export default function PerformanceGraph({
   unit = '',
   counter: counterProp,
   getter,
+  average = null,
 }: {
   title: string;
   color: string;
@@ -73,6 +74,7 @@ export default function PerformanceGraph({
   counter?: number;
   unit?: string;
   getter?: () => Promise<[number, number]>;
+  average?: number | null;
 }): JSX.Element {
   const [max, setMax] = useState(100);
   const labels = Array.from(Array(timeWindow_s / pollrate_s).keys())
@@ -137,6 +139,21 @@ export default function PerformanceGraph({
         },
         spanGaps: true,
       },
+      ...(average != null && Number.isFinite(average)
+        ? [
+            {
+              label: 'Average',
+              data: displayData.map(() => average),
+              borderColor: '#E6A23C',
+              backgroundColor: 'transparent',
+              borderWidth: 1.5,
+              fill: false,
+              pointRadius: 0,
+              pointHoverRadius: 0,
+              spanGaps: true,
+            },
+          ]
+        : []),
     ],
   };
 
@@ -192,8 +209,8 @@ export default function PerformanceGraph({
           align: 'inner',
           callback: function (val: number | string, idx: number) {
             const num = idx + counter;
-            if (idx === 0) return `${timeWindow_s - 1}s`;
-            if (idx === timeWindow_s - 1) return '0';
+            if (idx === 0) return spanLabel(timeWindow_s);
+            if (idx === labels.length - 1) return '0';
             if (num % 5 !== 0) return null;
             return '';
           },
@@ -244,6 +261,12 @@ export default function PerformanceGraph({
   };
 
   return <Line data={chartData} options={options} className={`${className}`} />;
+}
+
+function spanLabel(seconds: number): string {
+  if (seconds >= 60 && seconds % 60 === 0) return `${seconds / 60}m`;
+  if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
+  return `${seconds}s`;
 }
 
 const getOrCreateTooltip = (chart: UnionToIntersection<Chart<'line'>>) => {

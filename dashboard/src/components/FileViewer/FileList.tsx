@@ -3,7 +3,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { ClientFile } from 'bindings/ClientFile';
 import clsx from 'clsx';
 import Checkbox from 'components/Atoms/Checkbox';
-import { formatBytes, formatTimeAgo, supportedZip } from 'utils/util';
+import { formatBytes, supportedZip } from 'utils/util';
 import FileContextMenu from './FileContextMenu';
 import React, { useState, useEffect, useRef } from 'react';
 import { useEventListener, useOnClickOutside } from 'usehooks-ts';
@@ -54,6 +54,51 @@ const iconMap: { [key: string]: string } = {
   sh: '/icons/console.svg',
   mcfunction: '/icons/minecraft.svg',
 };
+
+export type FileSortKey = 'name' | 'modified' | 'size';
+export type FileSortDirection = 'asc' | 'desc';
+
+export function formatFileDate(unixSeconds: number | null | undefined): string {
+  if (!unixSeconds) return 'Unknown';
+  const date = new Date(Number(unixSeconds) * 1000);
+  if (Number.isNaN(date.getTime())) return 'Unknown';
+  return date.toLocaleDateString(undefined, {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+export function compareFiles(
+  left: ClientFile,
+  right: ClientFile,
+  key: FileSortKey,
+  direction: FileSortDirection
+): number {
+  const rank =
+    (left.file_type === 'Directory' ? 0 : 1) -
+    (right.file_type === 'Directory' ? 0 : 1);
+  if (rank !== 0) return rank;
+  let result = 0;
+  if (key === 'name') {
+    result = left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+  } else if (key === 'size') {
+    result = (left.size ?? 0) - (right.size ?? 0);
+  } else {
+    const leftTime = Number(left.modification_time ?? left.creation_time ?? 0);
+    const rightTime = Number(right.modification_time ?? right.creation_time ?? 0);
+    result = leftTime - rightTime;
+  }
+  return direction === 'asc' ? result : -result;
+}
+
+export function sortFiles(
+  files: ClientFile[],
+  key: FileSortKey,
+  direction: FileSortDirection
+): ClientFile[] {
+  return [...files].sort((left, right) => compareFiles(left, right, key, direction));
+}
 
 export default function FileList({
   path,
@@ -125,6 +170,25 @@ export default function FileList({
   const [contextMenuCoords, setContextMenuCoords] = useState({ x: 0, y: 0 });
   const [contextMenuFile, setContextMenuFile] = useState<ClientFile | null>();
   const [absCoords, setAbsCoords] = useState({ x: 0, y: 0 });
+  const [sort, setSort] = useState<{
+    key: FileSortKey;
+    direction: FileSortDirection;
+  } | null>(null);
+  const chooseSort = (key: FileSortKey) => {
+    setSort((current) => {
+      if (current?.key === key) {
+        return {
+          key,
+          direction: current.direction === 'asc' ? 'desc' : 'asc',
+        };
+      }
+      return { key, direction: 'asc' };
+    });
+  };
+  const sortedFiles =
+    sort && fileList ? sortFiles(fileList, sort.key, sort.direction) : fileList;
+  const sortMark = (key: FileSortKey) =>
+    sort?.key === key ? (sort.direction === 'asc' ? ' ↑' : ' ↓') : '';
   const [boundingDivDimensions, setBoundingDivDimensions] = useState({
     height: 0,
     width: 0,
@@ -295,6 +359,29 @@ export default function FileList({
           </div>
         ) : null}
 
+        <div className={fileTreeEntryClassName}>
+          <span className="w-4 shrink-0" />
+          <span className="h-4 w-4 shrink-0" />
+          <button type="button" className="text-left text-gray-400 hover:text-gray-300" onClick={() => chooseSort('name')}>
+            Name{sortMark('name')}
+          </button>
+          <div className="grow" />
+          <button
+            type="button"
+            className="hidden min-w-[8ch] text-left text-gray-400 hover:text-gray-300 @xs:inline"
+            onClick={() => chooseSort('modified')}
+          >
+            Modified{sortMark('modified')}
+          </button>
+          <button
+            type="button"
+            className="hidden min-w-[8ch] text-right text-gray-400 hover:text-gray-300 @sm:inline"
+            onClick={() => chooseSort('size')}
+          >
+            Size{sortMark('size')}
+          </button>
+        </div>
+
         {loading ? (
           <div className={fileTreeEntryClassName}>
             <p className="text-medium font-medium text-gray-400">Loading...</p>
@@ -314,7 +401,7 @@ export default function FileList({
             </p>
           </div>
         )}
-        {fileList?.map((file: ClientFile) => (
+        {sortedFiles?.map((file: ClientFile) => (
           <div
             key={file.path}
             className={clsx(fileTreeEntryClassName, 'hover:bg-gray-700', {
@@ -352,11 +439,7 @@ export default function FileList({
             <div className="grow"></div>
 
             <p className="hidden min-w-[8ch] text-left text-gray-500 @xs:inline">
-              {file.modification_time || file.creation_time
-                ? formatTimeAgo(
-                    Number(file.modification_time ?? file.creation_time) * 1000
-                  )
-                : 'Unknown Creation Time'}
+              {formatFileDate(file.modification_time ?? file.creation_time)}
             </p>
 
             <p className="hidden min-w-[8ch] text-right text-gray-500 @sm:inline">

@@ -1,6 +1,5 @@
-import { getSnowflakeTimestamp, LODESTONE_PORT } from './../utils/util';
+import { coreWsBase, getSnowflakeTimestamp } from './../utils/util';
 import { InstanceEvent } from './../bindings/InstanceEvent';
-import { match, otherwise } from 'variant';
 import { useUserAuthorized } from 'data/UserInfo';
 import axios from 'axios';
 import { useContext, useEffect, useRef, useState } from 'react';
@@ -26,31 +25,19 @@ export type ConsoleEvent = {
   message: string;
 };
 
-// function to convert a ClientEvent to a ConsoleEvent
-const toConsoleEvent = (event: ClientEvent): ConsoleEvent => {
-  const event_inner: InstanceEvent = match(
-    event.event_inner,
-    otherwise(
-      {
-        InstanceEvent: (instanceEvent) => instanceEvent,
-      },
-      () => {
-        throw new Error('Expected InstanceEvent');
-      }
-    )
-  );
+function consoleMessage(event: ClientEvent): string | null {
+  if (event.event_inner.type !== 'InstanceEvent') return null;
+  const inner = event.event_inner.instance_event_inner;
+  // A normal log line is also stored as a system message. Drawing both prints it twice.
+  if (inner.type === 'InstanceOutput') return inner.message;
+  return null;
+}
 
-  const message = match(
-    event_inner.instance_event_inner,
-    otherwise(
-      {
-        InstanceOutput: (instanceOutput) => instanceOutput.message,
-      },
-      () => {
-        throw new Error('Expected InstanceOutput');
-      }
-    )
-  );
+// function to convert a ClientEvent to a ConsoleEvent
+const toConsoleEvent = (event: ClientEvent): ConsoleEvent | null => {
+  const message = consoleMessage(event);
+  if (message === null || event.event_inner.type !== 'InstanceEvent') return null;
+  const event_inner: InstanceEvent = event.event_inner;
 
   return {
     timestamp: getSnowflakeTimestamp(event.snowflake),
@@ -61,6 +48,17 @@ const toConsoleEvent = (event: ClientEvent): ConsoleEvent => {
     message: message,
   };
 };
+
+function dedupeConsole(events: ConsoleEvent[]): ConsoleEvent[] {
+  const seen = new Set<string>();
+  const lines: ConsoleEvent[] = [];
+  events.forEach((event) => {
+    if (seen.has(event.snowflake)) return;
+    seen.add(event.snowflake);
+    lines.push(event);
+  });
+  return lines;
+}
 
 /**
  * Does two things:
@@ -75,8 +73,9 @@ const toConsoleEvent = (event: ClientEvent): ConsoleEvent => {
  */
 export const useConsoleStream = (uuid: string) => {
   const { core, token } = useContext(LodestoneContext);
-  const { address, port, apiVersion, protocol } = core;
+
   const [consoleLog, setConsoleLog] = useState<ConsoleEvent[]>([]);
+  const olderCount = useRef(0);
   const [status, setStatusInner] = useState<ConsoleStreamStatus>('loading'); //callbacks should use statusRef.current instead of status
   const statusRef = useRef<ConsoleStreamStatus>('loading');
   statusRef.current = status;
@@ -90,27 +89,37 @@ export const useConsoleStream = (uuid: string) => {
   );
 
   const clearConsoleLog = () => {
-    const econsoleLog: ConsoleEvent[] = []
-    setConsoleLog(econsoleLog)
-  }
+    olderCount.current = 0;
+    setConsoleLog([]);
+  };
+
+  const consoleEventsFrom = (events: ClientEvent[]): ConsoleEvent[] => {
+    return events
+      .map(toConsoleEvent)
+      .filter((event): event is ConsoleEvent => event !== null);
+  };
 
   const mergeConsoleLog = (newLog: ClientEvent[]) => {
     setConsoleLog((oldLog) => {
-      const consoleEvents = newLog
-        .filter((event) => {
-          return (
-            event.event_inner.type === 'InstanceEvent' &&
-            event.event_inner.instance_event_inner.type === 'InstanceOutput'
-          );
-        })
-        .map(toConsoleEvent);
-      const mergedLog = [...oldLog, ...consoleEvents];
-      // this is slow ik
-      return mergedLog.filter(
-        (event, index) =>
-          mergedLog.findIndex((e) => e.snowflake === event.snowflake) === index
-      );
+      const merged = dedupeConsole([...oldLog, ...consoleEventsFrom(newLog)]);
+      const max = olderCount.current + 1024;
+      if (merged.length <= max) return merged;
+      const history = merged.slice(0, olderCount.current);
+      const live = merged.slice(merged.length - 1024);
+      return dedupeConsole([...history, ...live]);
     });
+  };
+
+  const prependConsoleLog = (older: ClientEvent[]) => {
+    const incoming = consoleEventsFrom(older);
+    setConsoleLog((oldLog) => {
+      const fresh = incoming.filter(
+        (event) => !oldLog.some((line) => line.snowflake === event.snowflake)
+      );
+      olderCount.current += fresh.length;
+      return dedupeConsole([...fresh, ...oldLog]);
+    });
+    return incoming.length;
   };
 
   useEffect(() => {
@@ -122,9 +131,7 @@ export const useConsoleStream = (uuid: string) => {
 
     try {
       const websocket = new WebSocket(
-        `${protocol === 'https' ? 'wss' : 'ws'}://${address}:${
-          port ?? LODESTONE_PORT
-        }/api/${apiVersion}/instance/${uuid}/console/stream?token=Bearer ${token}`
+        `${coreWsBase(core)}/instance/${uuid}/console/stream?token=Bearer ${token}`
       );
 
       websocket.onopen = () => {
@@ -149,13 +156,17 @@ export const useConsoleStream = (uuid: string) => {
       console.error(e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [address, port, apiVersion, uuid, canAccessConsole]);
+  }, [core, uuid, canAccessConsole, token]);
 
   useEffect(() => {
     if (!canAccessConsole) return;
+    let cancelled = false;
+    olderCount.current = 0;
+    setConsoleLog([]);
     axios
       .get(`/instance/${uuid}/console/buffer`)
       .then((response) => {
+        if (cancelled) return;
         mergeConsoleLog(response.data);
         if (statusRef.current === 'loading') setStatus('buffered');
         if (statusRef.current === 'live-no-buffer') setStatus('live');
@@ -163,10 +174,26 @@ export const useConsoleStream = (uuid: string) => {
       .catch((e) => {
         console.error(e);
       });
+    return () => {
+      cancelled = true;
+    };
+    // mergeConsoleLog closes over setters only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canAccessConsole, uuid]);
+
+  const loadOlder = async (before: string): Promise<{ added: number; exhausted: boolean }> => {
+    const response = await axios.get<{ lines: ClientEvent[]; exhausted: boolean }>(
+      `/instance/${uuid}/console`,
+      { params: { before, limit: 300 } }
+    );
+    const added = prependConsoleLog(response.data.lines);
+    return { added, exhausted: response.data.exhausted };
+  };
+
   return {
     consoleLog,
     consoleStatus: status,
-    clearConsoleLog
+    clearConsoleLog,
+    loadOlder,
   };
 };

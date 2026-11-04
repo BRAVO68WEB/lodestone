@@ -9,12 +9,14 @@ import { match, otherwise } from 'variant';
 import { NotificationContext } from './NotificationContext';
 import { EventQuery } from 'bindings/EventQuery';
 import axios from 'axios';
-import { LODESTONE_PORT } from 'utils/util';
+import { coreSocket, coreWsBase } from 'utils/util';
 import { UserPermission } from 'bindings/UserPermission';
 import { PublicUser } from 'bindings/PublicUser';
 import { toast } from 'react-toastify';
 import { Player } from 'bindings/Player';
+import { TaskEntry } from 'bindings/TaskEntry';
 import { useQueryClient } from '@tanstack/react-query';
+import { requestInstanceStateSync } from 'data/InstanceStateSync';
 
 /**
  * does not return anything, call this for the side effect of subscribing to the event stream
@@ -24,11 +26,14 @@ export const useEventStream = () => {
   const queryClient = useQueryClient();
   const { dispatch, ongoingDispatch } = useContext(NotificationContext);
   const selfUid = useUid();
-  const { token, core, setCoreConnectionStatus, setToken } =
+  const { token, core, setCoreConnectionStatus, setToken, coreConnectionStatus } =
     useContext(LodestoneContext);
-  const socket = `${core.address}:${core.port}`;
+  const socket = coreSocket(core);
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnected = useRef(false);
+  const downTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const statusRef = useRef(coreConnectionStatus);
+  statusRef.current = coreConnectionStatus;
 
   const eventQuery: EventQuery = useMemo(
     () => ({
@@ -264,37 +269,62 @@ export const useEventStream = () => {
         MacroEvent: ({
           instance_uuid: uuid,
           macro_pid,
+          task_name,
+          creation_time,
           macro_event_inner: event_inner,
-        }) =>
-          match(event_inner, {
+        }) => {
+          const macroName = task_name || `pid ${macro_pid}`;
+          return match(event_inner, {
             Started: () => {
-              console.log(`Macro ${macro_pid} started on ${uuid}`);
+              if (fresh && uuid && task_name) {
+                queryClient.setQueryData<TaskEntry[]>(
+                  ['instance', uuid, 'taskList'],
+                  (old) => {
+                    const list = old ?? [];
+                    if (list.some((task) => task.pid === macro_pid)) return list;
+                    return [
+                      ...list,
+                      {
+                        name: task_name,
+                        creation_time: BigInt(creation_time ?? 0),
+                        pid: macro_pid,
+                      },
+                    ];
+                  }
+                );
+              }
               dispatch({
-                title: `Macro ${macro_pid} started on ${uuid}`,
+                title: `Macro ${macroName} started`,
                 event,
                 type: 'add',
                 fresh,
               });
             },
             Detach: () => {
-              console.log(`Macro ${macro_pid} detached on ${uuid}`);
               dispatch({
-                title: `Macro ${macro_pid} detached on ${uuid}`,
+                title: `Macro ${macroName} detached`,
                 event,
                 type: 'add',
                 fresh,
               });
             },
             Stopped: ({ exit_status }) => {
-              console.log(`Macro ${macro_pid} stopped on ${uuid} with status ${exit_status.type}`);
+              if (fresh && uuid) {
+                queryClient.setQueryData<TaskEntry[]>(
+                  ['instance', uuid, 'taskList'],
+                  (old) => (old ?? []).filter((task) => task.pid !== macro_pid)
+                );
+                queryClient.invalidateQueries(['instance', uuid, 'history']);
+              }
               dispatch({
-                title: `Macro ${macro_pid} stopped on ${uuid} with status ${exit_status.type}`,
+                title: `Macro ${macroName} stopped (${exit_status.type})`,
                 event,
                 type: 'add',
                 fresh,
               });
             },
-          }),
+          });
+        },
         PlayitggRunnerEvent: ({ playitgg_runner_event_inner: event_inner }) => {
           console.log(event_inner)
           match(event_inner, {
@@ -341,7 +371,10 @@ export const useEventStream = () => {
               inner,
               otherwise(
                 {
-                  ProgressionEnd: ({ inner }) => {
+                  ProgressionEnd: ({ success, message, inner }) => {
+                    if (!success) {
+                      toast.error(message || 'The task failed');
+                    }
                     if (!inner) return;
                     match(
                       inner,
@@ -351,11 +384,11 @@ export const useEventStream = () => {
                             addInstance(instance_info, queryClient),
                           InstanceDelete: ({ instance_uuid: uuid }) =>
                             deleteInstance(uuid, queryClient),
-                          FSOperationCompleted: ({ instance_uuid, success, message }) => {
-                            if (success) {
-                              toast.success(message)
-                            } else {
-                              toast.error(message)
+                          FSOperationCompleted: ({ instance_uuid, success: fsSuccess, message: fsMessage }) => {
+                            if (fsSuccess) {
+                              toast.success(fsMessage)
+                            } else if (success) {
+                              toast.error(fsMessage)
                             }
                             queryClient.invalidateQueries(['instance', instance_uuid, 'fileList']);
                           }
@@ -437,9 +470,15 @@ export const useEventStream = () => {
   useEffect(() => {
     if (!token) return;
 
+    const clearDownTimer = () => {
+      if (downTimer.current !== null) {
+        clearTimeout(downTimer.current);
+        downTimer.current = null;
+      }
+    };
+
     const connectWebsocket = () => {
-      const wsAddress = `${core.protocol === 'https' ? 'wss' : 'ws'}://${core.address}:${core.port ?? LODESTONE_PORT
-        }/api/${core.apiVersion}/events/all/stream?filter=${JSON.stringify(
+      const wsAddress = `${coreWsBase(core)}/events/all/stream?filter=${JSON.stringify(
           eventQuery
         )}`;
 
@@ -452,12 +491,13 @@ export const useEventStream = () => {
 
       websocket.onopen = () => {
         console.log('websocket opened');
+        clearDownTimer();
         setCoreConnectionStatus('success');
+        requestInstanceStateSync();
       };
 
       websocket.onerror = (event) => {
         console.error('websocket error', event);
-        setCoreConnectionStatus('error');
         websocket.close();
       };
 
@@ -468,8 +508,18 @@ export const useEventStream = () => {
 
       websocket.onclose = () => {
         console.log('websocket closed');
+        if (wsRef.current !== websocket) return;
         wsRef.current = null;
         if (!wsConnected.current) return;
+        clearDownTimer();
+        downTimer.current = setTimeout(() => {
+          downTimer.current = null;
+          if (!wsConnected.current) return;
+          const socket = wsRef.current;
+          if (socket && socket.readyState === WebSocket.OPEN) return;
+          if (statusRef.current === 'error') return;
+          setCoreConnectionStatus('error');
+        }, 2000);
         setTimeout(() => {
           console.log('reconnecting');
           connectWebsocket();
@@ -486,6 +536,7 @@ export const useEventStream = () => {
     return () => {
       console.log('unmounting event listener');
       wsConnected.current = false;
+      clearDownTimer();
       if (wsRef.current) {
         wsRef.current.close();
       }

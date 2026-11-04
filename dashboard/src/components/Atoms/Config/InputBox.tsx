@@ -78,7 +78,13 @@ export default function InputBox({
   const [error, setError] = useState<string>('');
   const [touched, setTouched] = useState<boolean>(false);
   const [typeModified, setTypeModified] = useState<string>(type); //in case we have password field which can switch between "text" and "password"
+  const [hasRevealed, setHasRevealed] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
+  const ignoreBlur = useRef(false);
+  const submitting = useRef(false);
+  const mask = '••••••••';
+  const masked = type === 'password' && !hasRevealed && value.length > 0;
+  const displayValue = masked ? mask : value;
 
   const validate = useCallback(
     async (value: string, submit: boolean) => {
@@ -123,26 +129,41 @@ export default function InputBox({
     setValue(initialValue ?? '');
   }, [initialValue]);
 
+  const applyMaskedEdit = (currentText: string) => {
+    if (currentText.startsWith(mask)) return value + currentText.slice(mask.length);
+    if (currentText.endsWith(mask)) {
+      return currentText.slice(0, currentText.length - mask.length) + value;
+    }
+    if (currentText.length < mask.length) {
+      const removed = mask.length - currentText.length;
+      return value.slice(0, Math.max(0, value.length - removed));
+    }
+    const typed = currentText.replace(/•/g, '');
+    return typed ? value + typed : value;
+  };
+
   const onChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const currentText = e.target.value;
-    setValue(currentText);
+    const next = masked ? applyMaskedEdit(e.target.value) : e.target.value;
+    setValue(next);
     setTouched(true);
     if (onChangeProp) {
-      const error = await catchAsyncToString(onChangeProp(currentText));
+      const error = await catchAsyncToString(onChangeProp(next));
       if (error) setError(error);
     }
   };
 
-  const onSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    // if (!touched) return;
-    const trimmed = value.trim();
+  const submitCurrent = async (raw: string) => {
+    if (submitting.current) return;
+    if (!touched) return;
+    const trimmed = raw.trim();
     setValue(trimmed);
+    submitting.current = true;
     setIsLoading(true);
-    const validateError = await catchAsyncToString(validate(value, true));
+    const validateError = await catchAsyncToString(validate(trimmed, true));
     if (validateError) {
       setError(validateError);
       setIsLoading(false);
+      submitting.current = false;
       return;
     }
     const submitError = await catchAsyncToString(onSubmitProp(trimmed));
@@ -150,6 +171,12 @@ export default function InputBox({
     setIsLoading(false);
     setTypeModified(type);
     setTouched(false);
+    submitting.current = false;
+  };
+
+  const onSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    await submitCurrent(value);
   };
 
   const onReset = (e: React.FormEvent<HTMLFormElement>) => {
@@ -190,6 +217,9 @@ export default function InputBox({
       <FontAwesomeIcon
         icon={faRotateRight}
         className="w-4 text-gray-faded/30 hover:cursor-pointer hover:text-gray-500"
+        onMouseDown={() => {
+          ignoreBlur.current = true;
+        }}
         onClick={() => formRef.current?.reset()}
         key="reset"
       />
@@ -200,12 +230,14 @@ export default function InputBox({
       <FontAwesomeIcon
         icon={typeModified === 'password' ? faEye : faEyeSlash}
         className="w-4 text-gray-faded/30 hover:cursor-pointer hover:text-gray-500"
+        onMouseDown={() => {
+          ignoreBlur.current = true;
+        }}
         onClick={() => {
+          setHasRevealed(true);
           typeModified === 'password'
             ? setTypeModified('text')
             : setTypeModified('password');
-          // allow in-progress password to persist between hide/show
-          // formRef.current?.reset();
         }}
         key="reveal password"
       />
@@ -268,19 +300,30 @@ export default function InputBox({
           </div>
         </div>
         <input
-          value={value}
+          value={displayValue}
           placeholder={placeholder}
           onChange={onChange}
-          maxLength={maxLength}
+          onPaste={(event) => {
+            if (!masked) return;
+            event.preventDefault();
+            const text = event.clipboardData.getData('text');
+            setValue((current) => current + text);
+            setTouched(true);
+          }}
+          maxLength={masked ? undefined : maxLength}
           style={{ paddingRight: `${icons.length * 1.5 + 0.75}rem` }} //0.75, 2.25, 3.75
           className={`input-shape input-background input-outlines input-text-style w-full ${errorText ? 'input-border-error' : 'input-border-normal'
             }
            `}
           onBlur={() => {
-            setValue(value.trim());
+            if (ignoreBlur.current) {
+              ignoreBlur.current = false;
+              return;
+            }
+            void submitCurrent(value);
           }}
           disabled={disabled}
-          type={typeModified}
+          type={masked ? 'text' : typeModified}
           autoComplete={DISABLE_AUTOFILL}
         />
       </form>

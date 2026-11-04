@@ -14,6 +14,7 @@ import {
   SectionFieldObject,
 } from './InstanceSettingsCreate/SettingObject';
 import { SettingOverrides } from './InstanceSettingsCreate/SettingOverrides';
+import InstanceLoaderUpdate from './InstanceLoaderUpdate';
 import { useDocumentTitle } from 'usehooks-ts';
 
 export default function InstanceSetting() {
@@ -73,10 +74,11 @@ export default function InstanceSetting() {
         Please backup any important data before proceeding.
       </ConfirmDialog>
 
+      <InstanceLoaderUpdate />
       {sections.map((section) => (
         <div
           key={section.section_id}
-          className="mb-16 flex flex-col gap-4 @4xl:flex-row"
+          className="mb-16 flex flex-col gap-4"
         >
           <div className="w-full shrink-0">
             <h2 className="text-h2 font-extrabold tracking-medium">
@@ -118,7 +120,7 @@ export default function InstanceSetting() {
           </div>
         </div>
       ))}
-      <div className="mb-16 flex flex-col gap-4 @4xl:flex-row">
+      <div className="mb-16 flex flex-col gap-4">
         <div className="w-full shrink-0">
           <h2 className="text-h2 font-extrabold tracking-medium">
             Danger Zone

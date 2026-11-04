@@ -5,5 +5,7 @@ import type { MacroEventInner } from './MacroEventInner';
 export interface MacroEvent {
   instance_uuid: InstanceUuid;
   macro_pid: number;
+  task_name?: string;
+  creation_time?: number;
   macro_event_inner: MacroEventInner;
 }

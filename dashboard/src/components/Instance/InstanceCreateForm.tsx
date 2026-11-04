@@ -136,6 +136,7 @@ export default function InstanceCreateForm({
           url: `/instance/create_generic`,
           headers: { 'Content-Type': 'application/json' },
           data: JSON.stringify({ url: url, setup_value: value }),
+          timeout: 120000,
         });
       } else {
         await axiosWrapper<void>({
@@ -143,6 +144,7 @@ export default function InstanceCreateForm({
           url: `/instance/create/${gameType}`,
           headers: { 'Content-Type': 'application/json' },
           data: JSON.stringify(value),
+          timeout: 120000,
         });
       }
     } catch (e) {
@@ -242,9 +244,9 @@ export default function InstanceCreateForm({
         {({ isSubmitting, status }) => (
           <Form
             id={formId}
-            className="flex max-h-[700px] min-h-[560px] w-[812px] rounded-2xl border-2 border-gray-faded/10 bg-gray-850 drop-shadow-lg"
+            className="flex max-h-[calc(100vh-2rem)] w-full max-w-[812px] flex-col overflow-hidden rounded-2xl border-2 border-gray-faded/10 bg-gray-850 drop-shadow-lg sm:flex-row"
           >
-            <div className="w-[180px] border-r border-gray-700 pt-8 ">
+            <div className="w-full shrink-0 border-b border-gray-700 pt-4 sm:w-[180px] sm:border-b-0 sm:border-r sm:pt-8">
               {sections.map((section, i) => (
                 <div
                   key={i}
@@ -257,7 +259,7 @@ export default function InstanceCreateForm({
                 </div>
               ))}
             </div>
-            <div className="flex w-[632px] flex-col p-8">
+            <div className="flex min-h-0 w-full flex-1 flex-col overflow-y-auto p-8">
               {activeStep == 0 ? (
                 <GameTypeSelectForm
                   manifestLoading={isLoading}
