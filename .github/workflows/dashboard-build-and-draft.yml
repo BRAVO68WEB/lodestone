@@ -69,19 +69,39 @@ jobs:
         run: npm ci
         working-directory: ./dashboard
 
+      - name: Skip updater signing unless the private key is a minisign secret
+        id: updater
+        shell: bash
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        run: |
+          first=$(printf '%s\n' "$TAURI_PRIVATE_KEY" | head -n 1 | tr -d '\r')
+          if printf '%s' "$first" | grep -q '^untrusted comment:'; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            node <<'NODE'
+            const fs = require('fs');
+            const path = 'dashboard/src-tauri/tauri.conf.json';
+            const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            cfg.tauri.updater.active = false;
+            fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
+            NODE
+          fi
+
       - name: Build Tauri desktop app
         uses: tauri-apps/tauri-action@v0
         id: tauri
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY: ${{ steps.updater.outputs.sign == 'true' && secrets.TAURI_PRIVATE_KEY || '' }}
         with:
           projectPath: ./dashboard
           tagName: ${{ inputs.version || null }}
           releaseName: ${{ inputs.version || null }}
           releaseBody: "Automated release for ${{ inputs.version }}"
-          includeUpdaterJson: true
+          includeUpdaterJson: ${{ steps.updater.outputs.sign == 'true' }}
           releaseDraft: true
           prerelease: true
           includeDebug: ${{ inputs.debug }}
