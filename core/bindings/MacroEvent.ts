@@ -3,4 +3,4 @@ import type { InstanceUuid } from "./InstanceUuid";
 import type { MacroEventInner } from "./MacroEventInner";
 import type { MacroPID } from "./MacroPID";
 
-export interface MacroEvent { instance_uuid: InstanceUuid | null, macro_pid: MacroPID, macro_event_inner: MacroEventInner, }
+export interface MacroEvent { instance_uuid: InstanceUuid | null, macro_pid: MacroPID, task_name: string, creation_time: bigint, macro_event_inner: MacroEventInner, }

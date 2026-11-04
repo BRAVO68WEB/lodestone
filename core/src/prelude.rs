@@ -59,7 +59,7 @@ pub fn app_state() -> &'static AppState {
 /// This function should only be called once.
 ///
 /// Also creates the directories if they don't exist.
-pub fn init_paths(lodestone_path: PathBuf) {
+pub fn init_paths(lodestone_path: PathBuf) -> std::io::Result<()> {
     let path_to_instances = lodestone_path.join("instances");
     let path_to_binaries = lodestone_path.join("bin");
     let path_to_stores = lodestone_path.join("stores");
@@ -67,10 +67,10 @@ pub fn init_paths(lodestone_path: PathBuf) {
     let path_to_users = lodestone_path.join("stores").join("users.json");
     let path_to_tmp = lodestone_path.join("tmp");
 
-    std::fs::create_dir_all(&path_to_instances).unwrap();
-    std::fs::create_dir_all(&path_to_binaries).unwrap();
-    std::fs::create_dir_all(&path_to_stores).unwrap();
-    std::fs::create_dir_all(&path_to_tmp).unwrap();
+    std::fs::create_dir_all(&path_to_instances)?;
+    std::fs::create_dir_all(&path_to_binaries)?;
+    std::fs::create_dir_all(&path_to_stores)?;
+    std::fs::create_dir_all(&path_to_tmp)?;
     // std::fs::File::create(&path_to_global_settings).unwrap();
     // std::fs::File::create(&path_to_users).unwrap();
     // std::fs::File::create(&path_to_tmp).unwrap();
@@ -82,6 +82,7 @@ pub fn init_paths(lodestone_path: PathBuf) {
     let _ = PATH_TO_GLOBAL_SETTINGS.set(path_to_global_settings);
     let _ = PATH_TO_USERS.set(path_to_users);
     let _ = PATH_TO_TMP.set(path_to_tmp);
+    Ok(())
 }
 
 thread_local! {

@@ -1,9 +1,11 @@
 use tracing::error;
 
 use crate::{
-    error::Error,
+    error::{Error, ErrorKind},
     events::CausedBy,
-    traits::t_server::{MonitorReport, State, TServer},
+    traits::t_server::{
+        MonitorReport, PlayerAction, PlayerInventory, PlayerLocation, State, TServer,
+    },
 };
 
 use super::{bridge::procedure_call::ProcedureCallInner, GenericInstance};
@@ -67,5 +69,21 @@ impl TServer for GenericInstance {
             .map_or(MonitorReport::default(), |r| {
                 r.try_into().unwrap_or_default()
             })
+    }
+    async fn player_where(&self, _name: &str) -> Result<PlayerLocation, Error> {
+        Ok(PlayerLocation::unavailable(
+            "This instance does not support player location.",
+        ))
+    }
+    async fn player_inventory(&self, _name: &str) -> Result<PlayerInventory, Error> {
+        Ok(PlayerInventory::unavailable(
+            "This instance does not support player inventory.",
+        ))
+    }
+    async fn player_action(&self, _name: &str, _action: PlayerAction) -> Result<String, Error> {
+        Err(Error {
+            kind: ErrorKind::UnsupportedOperation,
+            source: color_eyre::eyre::eyre!("This instance does not support player commands"),
+        })
     }
 }

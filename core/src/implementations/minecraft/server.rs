@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Context};
@@ -18,19 +18,97 @@ use crate::implementations::minecraft::util::name_to_uuid;
 use crate::macro_executor::{DefaultWorkerOptionGenerator, SpawnResult};
 use crate::traits::t_configurable::TConfigurable;
 use crate::traits::t_macro::TaskEntry;
-use crate::traits::t_server::{MonitorReport, State, StateAction, TServer};
+use crate::traits::t_server::{
+    MonitorReport, PlayerAction, PlayerInventory, PlayerLocation, State, StateAction, TServer,
+};
 
 use crate::types::Snowflake;
 use crate::util::{dont_spawn_terminal, list_dir};
 
 use super::r#macro::resolve_macro_invocation;
+use super::util::resolve_instance_java;
 use super::{Flavour, ForgeBuildVersion, MinecraftInstance};
+use crate::traits::t_configurable::manifest::ConfigurableValue;
 use tracing::{error, info, warn};
+
+const QUICK_CRASH_SECS: u64 = 15;
+const MAX_QUICK_CRASHES: u32 = 3;
+const STOP_GRACE: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopDeadline {
+    Done,
+    Kill,
+}
+
+pub(crate) fn stop_deadline_action(stopped: bool) -> StopDeadline {
+    if stopped {
+        StopDeadline::Done
+    } else {
+        StopDeadline::Kill
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrashExit {
+    Stop,
+    Restart,
+    GiveUp,
+}
+
+/// A crash counts toward the streak when it follows the previous one within
+/// `QUICK_CRASH_SECS`. A longer run resets the streak to 1.
+pub(crate) fn next_crash_streak(previous_streak: u32, seconds_since_last: Option<u64>) -> u32 {
+    match seconds_since_last {
+        Some(secs) if secs < QUICK_CRASH_SECS => previous_streak.saturating_add(1),
+        _ => 1,
+    }
+}
+
+pub(crate) fn crash_exit_action(
+    user_stop: bool,
+    restart_on_crash: bool,
+    streak: u32,
+) -> CrashExit {
+    if user_stop || !restart_on_crash {
+        CrashExit::Stop
+    } else if streak >= MAX_QUICK_CRASHES {
+        CrashExit::GiveUp
+    } else {
+        CrashExit::Restart
+    }
+}
 
 #[async_trait::async_trait]
 impl TServer for MinecraftInstance {
     async fn start(&self, cause_by: CausedBy, block: bool) -> Result<(), Error> {
-        let config = self.config.lock().await.clone();
+        let mut config = self.config.lock().await.clone();
+        let resolved = resolve_instance_java(
+            &mut config,
+            &self.path_to_runtimes,
+            &self.path_to_instance,
+        )?;
+        if resolved.changed {
+            *self.config.lock().await = config.clone();
+            if let Err(err) = self.configurable_manifest.lock().await.set_setting_value(
+                "cmd_args_section",
+                "java_cmd",
+                Some(ConfigurableValue::String(
+                    resolved.binary.to_string_lossy().into_owned(),
+                )),
+            ) {
+                warn!(
+                    "[{}] Failed to update the Java command setting: {err}",
+                    config.name
+                );
+            }
+            self.write_config_to_file().await?;
+            info!(
+                "[{}] Using Java {} for Minecraft {}",
+                config.name, config.jre_major_version, config.version
+            );
+        }
+        let jre = resolved.binary;
         self.state.lock().await.try_transition(
             StateAction::UserStart,
             Some(&|state| {
@@ -46,6 +124,8 @@ impl TServer for MinecraftInstance {
                 });
             }),
         )?;
+        self.user_stop.store(false, Ordering::SeqCst);
+        *self.where_pack_ready.lock().await = false;
 
         if !port_scanner::local_port_available(config.port as u16) {
             return Err(Error {
@@ -66,6 +146,8 @@ impl TServer for MinecraftInstance {
                     None,
                     None,
                     Some(self.uuid.clone()),
+                    "prelaunch".to_string(),
+                    chrono::Utc::now().timestamp(),
                 )
                 .await;
 
@@ -98,20 +180,6 @@ impl TServer for MinecraftInstance {
                 config.name.clone()
             );
         }
-
-        let jre = if let Some(jre) = &config.java_cmd {
-            PathBuf::from(jre)
-        } else {
-            self.path_to_runtimes
-                .join("java")
-                .join(format!("jre{}", config.jre_major_version))
-                .join(if std::env::consts::OS == "macos" {
-                    "Contents/Home/bin"
-                } else {
-                    "bin"
-                })
-                .join("java")
-        };
 
         let mut server_start_command = Command::new(&jre);
         let server_start_command = server_start_command
@@ -442,6 +510,20 @@ impl TServer for MinecraftInstance {
                             }
                         }
                         info!("Instance {} process shutdown", name);
+                        let user_stop = __self.user_stop.swap(false, Ordering::SeqCst);
+                        let restart_on_crash =
+                            __self.restart_on_crash.load(Ordering::Relaxed);
+                        let streak = if user_stop || !restart_on_crash {
+                            *__self.crash_streak.lock().await = (0, None);
+                            0
+                        } else {
+                            let mut streak = __self.crash_streak.lock().await;
+                            let seconds_since_last = streak.1.map(|last| last.elapsed().as_secs());
+                            let next = next_crash_streak(streak.0, seconds_since_last);
+                            *streak = (next, Some(std::time::Instant::now()));
+                            next
+                        };
+                        let action = crash_exit_action(user_stop, restart_on_crash, streak);
                         __self
                             .state
                             .lock()
@@ -464,8 +546,45 @@ impl TServer for MinecraftInstance {
                                 }),
                             )
                             .unwrap();
-                        __self.players_manager.lock().await.clear(name);
+                        __self.players_manager.lock().await.clear(name.clone());
                         __self.rcon_conn.lock().await.take();
+                        match action {
+                            CrashExit::Restart => {
+                                let again = __self.clone();
+                                let restart_name = name.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) =
+                                        again.start(CausedBy::System, false).await
+                                    {
+                                        error!(
+                                            "[{}] Failed to restart after a crash: {}",
+                                            restart_name, err
+                                        );
+                                    }
+                                });
+                            }
+                            CrashExit::GiveUp => {
+                                warn!(
+                                    "[{}] Crashed {} times within {} seconds. Automatic restart stopped.",
+                                    name, streak, QUICK_CRASH_SECS
+                                );
+                                event_broadcaster.send(Event {
+                                    event_inner: EventInner::InstanceEvent(InstanceEvent {
+                                        instance_name: name.clone(),
+                                        instance_uuid: uuid.clone(),
+                                        instance_event_inner: InstanceEventInner::InstanceError {
+                                            message: format!(
+                                                "Server crashed {streak} times within {QUICK_CRASH_SECS} seconds. Automatic restart stopped."
+                                            ),
+                                        },
+                                    }),
+                                    snowflake: Snowflake::default(),
+                                    details: "Restart on crash gave up".to_string(),
+                                    caused_by: CausedBy::System,
+                                });
+                            }
+                            CrashExit::Stop => {}
+                        }
                     }
                 });
                 self.config.lock().await.has_started = true;
@@ -529,7 +648,8 @@ impl TServer for MinecraftInstance {
     async fn stop(&self, cause_by: CausedBy, block: bool) -> Result<(), Error> {
         let config = self.config.lock().await.clone();
 
-        self.state.lock().await.try_transition(
+        self.user_stop.store(true, Ordering::SeqCst);
+        if let Err(err) = self.state.lock().await.try_transition(
             StateAction::UserStop,
             Some(&|state| {
                 self.event_broadcaster.send(Event {
@@ -543,7 +663,10 @@ impl TServer for MinecraftInstance {
                     caused_by: cause_by.clone(),
                 });
             }),
-        )?;
+        ) {
+            self.user_stop.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
         let name = config.name.clone();
         let _uuid = self.uuid.clone();
         self.stdin
@@ -562,24 +685,15 @@ impl TServer for MinecraftInstance {
                 e
             })?;
         self.rcon_conn.lock().await.take();
-        let mut rx = self.event_broadcaster.subscribe();
-        let instance_uuid = self.uuid.clone();
-
+        let waiter = self.clone();
         if block {
-            while let Ok(event) = rx.recv().await {
-                if let EventInner::InstanceEvent(InstanceEvent {
-                    instance_uuid: event_instance_uuid,
-                    instance_event_inner: InstanceEventInner::StateTransition { to },
-                    ..
-                }) = event.event_inner
-                {
-                    if instance_uuid == event_instance_uuid && to == State::Stopped {
-                        return Ok(());
-                    }
-                }
-            }
-            Err(eyre!("Sender shutdown").into())
+            waiter.enforce_stop_deadline().await
         } else {
+            tokio::spawn(async move {
+                if let Err(err) = waiter.enforce_stop_deadline().await {
+                    error!("Stop deadline failed: {err}");
+                }
+            });
             Ok(())
         }
     }
@@ -604,6 +718,7 @@ impl TServer for MinecraftInstance {
     }
 
     async fn kill(&self, _cause_by: CausedBy) -> Result<(), Error> {
+        self.user_stop.store(true, Ordering::SeqCst);
         let config = self.config.lock().await.clone();
 
         if self.state().await == State::Stopped {
@@ -649,6 +764,7 @@ impl TServer for MinecraftInstance {
             match self.stdin.lock().await.as_mut() {
                 Some(stdin) => match {
                     if command == "stop" {
+                        self.user_stop.store(true, Ordering::SeqCst);
                         self.state.lock().await.try_new_state(
                             StateAction::UserStop,
                             Some(&|state| {
@@ -690,29 +806,199 @@ impl TServer for MinecraftInstance {
         }
     }
     async fn monitor(&self) -> MonitorReport {
-        let mut sys = self.system.lock().await;
-        sys.refresh_memory();
-        if let Some(pid) = self.process.lock().await.as_ref().and_then(|p| p.id()) {
-            sys.refresh_process(Pid::from_u32(pid));
-            let proc = (*sys).process(Pid::from_u32(pid));
-            if let Some(proc) = proc {
-                let cpu_usage =
-                    sys.process(Pid::from_u32(pid)).unwrap().cpu_usage() / sys.cpus().len() as f32;
-
-                let memory_usage = proc.memory();
-                let disk_usage = proc.disk_usage();
-                let start_time = proc.start_time();
-                MonitorReport {
-                    memory_usage: Some(memory_usage),
-                    disk_usage: Some(disk_usage.into()),
-                    cpu_usage: Some(cpu_usage),
-                    start_time: Some(start_time),
-                }
-            } else {
-                MonitorReport::default()
+        let sample = {
+            let mut sys = self.system.lock().await;
+            sys.refresh_memory();
+            let Some(pid) = self.process.lock().await.as_ref().and_then(|p| p.id()) else {
+                drop(sys);
+                *self.cpu_primed_pid.lock().await = None;
+                return MonitorReport::default();
+            };
+            if !sys.refresh_process(Pid::from_u32(pid)) {
+                drop(sys);
+                *self.cpu_primed_pid.lock().await = None;
+                return MonitorReport::default();
             }
-        } else {
-            MonitorReport::default()
+            let Some(proc) = sys.process(Pid::from_u32(pid)) else {
+                drop(sys);
+                *self.cpu_primed_pid.lock().await = None;
+                return MonitorReport::default();
+            };
+            let memory_usage = proc.memory();
+            let disk_usage = proc.disk_usage();
+            let start_time = proc.start_time();
+            let raw_cpu = proc.cpu_usage();
+            let cpu_count = (sys.cpus().len().max(1)) as f32;
+            (pid, memory_usage, disk_usage, start_time, raw_cpu, cpu_count)
+        };
+        let (pid, memory_usage, disk_usage, start_time, raw_cpu, cpu_count) = sample;
+        let mut primed = self.cpu_primed_pid.lock().await;
+        let seen = *primed == Some(pid);
+        *primed = Some(pid);
+        drop(primed);
+        MonitorReport {
+            memory_usage: Some(memory_usage),
+            disk_usage: Some(disk_usage.into()),
+            cpu_usage: if seen {
+                Some(raw_cpu / cpu_count)
+            } else {
+                None
+            },
+            start_time: Some(start_time),
         }
+    }
+
+    async fn player_where(&self, name: &str) -> Result<PlayerLocation, Error> {
+        self.where_player(name).await
+    }
+
+    async fn player_inventory(&self, name: &str) -> Result<PlayerInventory, Error> {
+        self.read_player_inventory(name).await
+    }
+
+    async fn player_action(&self, name: &str, action: PlayerAction) -> Result<String, Error> {
+        self.run_player_action(name, action).await
+    }
+}
+
+impl MinecraftInstance {
+    async fn enforce_stop_deadline(&self) -> Result<(), Error> {
+        if self.state().await == State::Stopped {
+            return Ok(());
+        }
+        let mut rx = self.event_broadcaster.subscribe();
+        let uuid = self.uuid.clone();
+        let wait_stopped = async {
+            loop {
+                if self.state().await == State::Stopped {
+                    return;
+                }
+                match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                    Ok(Ok(event)) => {
+                        if let EventInner::InstanceEvent(InstanceEvent {
+                            instance_uuid,
+                            instance_event_inner:
+                                InstanceEventInner::StateTransition {
+                                    to: State::Stopped,
+                                },
+                            ..
+                        }) = event.event_inner
+                        {
+                            if instance_uuid == uuid {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return,
+                    Err(_) => {}
+                }
+            }
+        };
+        let _ = tokio::time::timeout(STOP_GRACE, wait_stopped).await;
+        match stop_deadline_action(self.state().await == State::Stopped) {
+            StopDeadline::Done => Ok(()),
+            StopDeadline::Kill => {
+                self.kill_after_stop_timeout().await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn kill_after_stop_timeout(&self) {
+        let name = self.config.lock().await.name.clone();
+        warn!(
+            "[{}] Stop timed out after {} seconds. Killing the process.",
+            name,
+            STOP_GRACE.as_secs()
+        );
+        self.event_broadcaster.send(Event {
+            event_inner: EventInner::InstanceEvent(InstanceEvent {
+                instance_name: name.clone(),
+                instance_uuid: self.uuid.clone(),
+                instance_event_inner: InstanceEventInner::InstanceWarning {
+                    message: format!(
+                        "Stop timed out after {} seconds. The process was killed.",
+                        STOP_GRACE.as_secs()
+                    ),
+                },
+            }),
+            snowflake: Snowflake::default(),
+            details: "Stop timed out".to_string(),
+            caused_by: CausedBy::System,
+        });
+        if let Some(process) = self.process.lock().await.as_mut() {
+            if let Err(err) = process.kill().await {
+                warn!(
+                    "[{}] Failed to kill process after stop timeout: {}",
+                    name, err
+                );
+            }
+        }
+        let grace = async {
+            loop {
+                if self.state().await == State::Stopped {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), grace)
+            .await
+            .is_err()
+            && self.state().await != State::Stopped
+        {
+            let _ = self.state.lock().await.try_transition(
+                StateAction::InstanceStop,
+                Some(&|state| {
+                    self.event_broadcaster.send(Event::new_instance_state_transition(
+                        self.uuid.clone(),
+                        name.clone(),
+                        state,
+                    ));
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod crash_restart_tests {
+    use super::{
+        crash_exit_action, next_crash_streak, stop_deadline_action, CrashExit, StopDeadline,
+    };
+
+    #[test]
+    fn user_stop_does_not_restart() {
+        assert_eq!(crash_exit_action(true, true, 1), CrashExit::Stop);
+    }
+
+    #[test]
+    fn a_stop_that_is_still_running_asks_for_a_kill() {
+        assert_eq!(stop_deadline_action(false), StopDeadline::Kill);
+        assert_eq!(stop_deadline_action(true), StopDeadline::Done);
+    }
+
+    #[test]
+    fn unexpected_exit_restarts_once() {
+        let streak = next_crash_streak(0, None);
+        assert_eq!(streak, 1);
+        assert_eq!(crash_exit_action(false, true, streak), CrashExit::Restart);
+    }
+
+    #[test]
+    fn quick_crashes_give_up() {
+        let mut streak = 0;
+        streak = next_crash_streak(streak, None);
+        streak = next_crash_streak(streak, Some(5));
+        streak = next_crash_streak(streak, Some(5));
+        assert_eq!(streak, 3);
+        assert_eq!(crash_exit_action(false, true, streak), CrashExit::GiveUp);
+    }
+
+    #[test]
+    fn a_long_run_resets_the_streak() {
+        assert_eq!(next_crash_streak(2, Some(30)), 1);
+        assert_eq!(crash_exit_action(false, false, 1), CrashExit::Stop);
     }
 }

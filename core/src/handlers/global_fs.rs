@@ -28,7 +28,7 @@ use crate::{
 };
 
 use super::util::decode_base64;
-use crate::prelude::path_to_tmp;
+use crate::prelude::{lodestone_path, path_to_tmp};
 use tempfile::TempDir;
 
 pub enum DownloadableFile {
@@ -103,6 +103,34 @@ impl From<&std::path::Path> for FileEntry {
     }
 }
 
+#[derive(Serialize)]
+struct FsRoot {
+    path: String,
+}
+
+/// The Lodestone data directory. The host-file screen starts here.
+async fn fs_root(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    AuthBearer(token): AuthBearer,
+) -> Result<Json<FsRoot>, Error> {
+    let requester = state
+        .users_manager
+        .read()
+        .await
+        .try_auth(&token)
+        .ok_or_else(|| Error {
+            kind: ErrorKind::Unauthorized,
+            source: eyre!("Token error"),
+        })?;
+    requester.try_action(
+        &UserAction::ReadGlobalFile,
+        state.global_settings.lock().await.safe_mode(),
+    )?;
+    Ok(Json(FsRoot {
+        path: lodestone_path().to_string_lossy().into_owned(),
+    }))
+}
+
 async fn list_files(
     axum::extract::State(state): axum::extract::State<AppState>,
     Path(base64_absolute_path): Path<String>,
@@ -130,8 +158,9 @@ async fn list_files(
         .await?
         .iter()
         .map(|p| {
-            let r: FileEntry = p.as_path().into();
-            r
+            let mut entry: FileEntry = p.as_path().into();
+            entry.path = p.to_string_lossy().into_owned();
+            entry
         })
         .collect();
     state.event_broadcaster.send(new_fs_event(
@@ -638,6 +667,7 @@ async fn download(
 
 pub fn get_global_fs_routes(state: AppState) -> Router {
     Router::new()
+        .route("/fs/root", get(fs_root))
         .route("/fs/:base64_absolute_path/ls", get(list_files))
         .route("/fs/:base64_absolute_path/read", get(read_file))
         .route("/fs/:base64_absolute_path/write", put(write_file))

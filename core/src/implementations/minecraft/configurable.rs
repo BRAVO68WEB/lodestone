@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic;
 
 use async_trait::async_trait;
 use color_eyre::eyre::{eyre, Context, ContextCompat};
+use tokio::process::Command;
 
 use crate::error::{Error, ErrorKind};
 use crate::prelude::path_to_tmp;
@@ -13,10 +16,215 @@ use crate::traits::t_configurable::{Game, TConfigurable};
 use crate::traits::t_server::State;
 
 use crate::types::InstanceUuid;
-use crate::util::download_file;
+use crate::util::{dont_spawn_terminal, download_file};
 
-use super::util::{get_fabric_jar_url, get_paper_jar_url, get_vanilla_jar_url};
-use super::MinecraftInstance;
+use super::loader_update::{self, LoaderUpdate};
+use super::util::{
+    get_fabric_jar_url, get_forge_jar_url, get_paper_jar_url, get_vanilla_jar_url,
+    java_runtime_binary,
+};
+use super::{
+    FabricInstallerVersion, FabricLoaderVersion, Flavour, ForgeBuildVersion, MinecraftInstance,
+    PaperBuildVersion,
+};
+
+/// The process-exit path reads `restart_on_crash`. This must not write `auto_start`.
+pub(crate) fn store_restart_on_crash(
+    auto_start: &atomic::AtomicBool,
+    restart_on_crash: &atomic::AtomicBool,
+    value: bool,
+) {
+    let _ = auto_start;
+    restart_on_crash.store(value, atomic::Ordering::Relaxed);
+}
+
+impl MinecraftInstance {
+    pub async fn update_loader(&self, update: LoaderUpdate) -> Result<(), Error> {
+        if *self.state.lock().await != State::Stopped {
+            return Err(Error {
+                kind: ErrorKind::BadRequest,
+                source: eyre!("Stop the server before updating the jar"),
+            });
+        }
+        let version = loader_update::require_token(update.version.trim(), "Version")?;
+        let flavour = self.config.lock().await.flavour.clone();
+        let resolved = match flavour {
+            Flavour::Spigot => {
+                return Err(Error {
+                    kind: ErrorKind::UnsupportedOperation,
+                    source: eyre!("Spigot updates are not supported"),
+                })
+            }
+            Flavour::Vanilla => {
+                let (url, resolved) = get_vanilla_jar_url(&version).await.ok_or_else(|| {
+                    Error {
+                        kind: ErrorKind::BadRequest,
+                        source: eyre!("No vanilla jar for {version}"),
+                    }
+                })?;
+                self.install_server_jar(&url).await?;
+                resolved
+            }
+            Flavour::Fabric { .. } => {
+                let loader =
+                    loader_update::optional_token(update.loader_version, "Loader version")?;
+                let installer =
+                    loader_update::optional_token(update.installer_version, "Installer version")?;
+                let (loader, installer) = match (loader, installer) {
+                    (None, None) => (None, None),
+                    (Some(loader), Some(installer)) => (
+                        Some(FabricLoaderVersion(loader)),
+                        Some(FabricInstallerVersion(installer)),
+                    ),
+                    _ => {
+                        return Err(Error {
+                            kind: ErrorKind::BadRequest,
+                            source: eyre!(
+                                "Set both the Fabric loader and installer, or leave both blank for the latest stable"
+                            ),
+                        })
+                    }
+                };
+                let (url, resolved) = get_fabric_jar_url(&version, &loader, &installer)
+                    .await
+                    .ok_or_else(|| Error {
+                        kind: ErrorKind::BadRequest,
+                        source: eyre!("No Fabric jar for {version}"),
+                    })?;
+                self.install_server_jar(&url).await?;
+                resolved
+            }
+            Flavour::Paper { .. } => {
+                let build = match loader_update::optional_token(update.build, "Build")? {
+                    Some(text) => Some(PaperBuildVersion(text.parse::<i64>().map_err(|_| {
+                        Error {
+                            kind: ErrorKind::BadRequest,
+                            source: eyre!("Paper build must be a number"),
+                        }
+                    })?)),
+                    None => None,
+                };
+                let (url, resolved) =
+                    get_paper_jar_url(&version, &build).await.ok_or_else(|| Error {
+                        kind: ErrorKind::BadRequest,
+                        source: eyre!("No Paper jar for {version}"),
+                    })?;
+                self.install_server_jar(&url).await?;
+                resolved
+            }
+            Flavour::Forge { .. } => {
+                let build = loader_update::optional_token(update.build, "Build")?
+                    .map(ForgeBuildVersion);
+                let (url, resolved) = get_forge_jar_url(&version, &build).await?;
+                self.install_forge(&url).await?;
+                resolved
+            }
+        };
+        self.store_loader(version, resolved).await
+    }
+
+    async fn install_server_jar(&self, url: &str) -> Result<(), Error> {
+        let temp_dir = tempfile::tempdir_in(path_to_tmp()).context("Failed to create temp dir")?;
+        let progress = |_| {};
+        download_file(url, temp_dir.path(), Some("server.jar"), &progress, true).await?;
+        self.ensure_stopped().await?;
+        let source = temp_dir.path().join("server.jar");
+        let instance = self.path_to_instance.clone();
+        match tokio::task::spawn_blocking(move || loader_update::replace_server_jar(&instance, &source))
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(Error {
+                kind: ErrorKind::Internal,
+                source: eyre!("Server jar install stopped: {err}"),
+            }),
+        }
+    }
+
+    async fn install_forge(&self, url: &str) -> Result<(), Error> {
+        let java = self.java_binary().await;
+        if !java.is_file() {
+            return Err(Error {
+                kind: ErrorKind::BadRequest,
+                source: eyre!("Java for this instance is missing"),
+            });
+        }
+        let temp_dir = tempfile::tempdir_in(path_to_tmp()).context("Failed to create temp dir")?;
+        let progress = |_| {};
+        download_file(
+            url,
+            temp_dir.path(),
+            Some("forge-installer.jar"),
+            &progress,
+            true,
+        )
+        .await?;
+        let installer = temp_dir.path().join("forge-installer.jar");
+        let instance = self.path_to_instance.clone();
+        let stash = tempfile::tempdir_in(path_to_tmp()).context("Failed to snapshot the instance")?;
+        loader_update::snapshot_protected(&instance, stash.path())?;
+        self.ensure_stopped().await?;
+        let status = {
+            let mut command = Command::new(&java);
+            command
+                .arg("-jar")
+                .arg(&installer)
+                .arg("--installServer")
+                .arg(&instance)
+                .current_dir(&instance);
+            dont_spawn_terminal(&mut command)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .status()
+                .await
+                .context("Failed to start the Forge installer")
+        };
+        loader_update::restore_protected(&instance, stash.path())?;
+        if !status?.success() {
+            return Err(Error {
+                kind: ErrorKind::External,
+                source: eyre!("Forge installer failed"),
+            });
+        }
+        let leftover = instance.join("forge-installer.jar");
+        if leftover.is_file() {
+            let _ = tokio::fs::remove_file(leftover).await;
+        }
+        Ok(())
+    }
+
+    async fn ensure_stopped(&self) -> Result<(), Error> {
+        if *self.state.lock().await != State::Stopped {
+            return Err(Error {
+                kind: ErrorKind::BadRequest,
+                source: eyre!("Stop the server before updating the jar"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn java_binary(&self) -> PathBuf {
+        let config = self.config.lock().await;
+        if let Some(command) = &config.java_cmd {
+            if !command.is_empty() {
+                return PathBuf::from(command);
+            }
+        }
+        let major = config.jre_major_version;
+        drop(config);
+        java_runtime_binary(&self.path_to_runtimes, major)
+    }
+
+    async fn store_loader(&self, version: String, flavour: Flavour) -> Result<(), Error> {
+        {
+            let mut config = self.config.lock().await;
+            config.version = version;
+            config.flavour = flavour;
+        }
+        self.write_config_to_file().await
+    }
+}
 
 #[async_trait]
 impl TConfigurable for MinecraftInstance {
@@ -104,72 +312,18 @@ impl TConfigurable for MinecraftInstance {
 
     async fn set_restart_on_crash(&self, restart_on_crash: bool) -> Result<(), Error> {
         self.config.lock().await.restart_on_crash = restart_on_crash;
-        self.auto_start
-            .store(restart_on_crash, atomic::Ordering::Relaxed);
+        store_restart_on_crash(&self.auto_start, &self.restart_on_crash, restart_on_crash);
         self.write_config_to_file().await
     }
 
     async fn change_version(&self, version: String) -> Result<(), Error> {
-        if *self.state.lock().await != State::Stopped {
-            return Err(Error {
-                kind: ErrorKind::BadRequest,
-                source: eyre!("Cannot change version while server is running"),
-            });
-        }
-        if version == self.config.lock().await.version {
-            return Ok(());
-        }
-        let (url, _) = match self.config.lock().await.flavour {
-            super::Flavour::Vanilla => get_vanilla_jar_url(&version).await.ok_or_else(|| {
-                let error_msg =
-                    format!("Cannot get the vanilla jar version for version {}", version);
-                Error {
-                    kind: ErrorKind::BadRequest,
-                    source: eyre!(error_msg),
-                }
-            })?,
-            super::Flavour::Fabric { .. } => get_fabric_jar_url(&version, &None, &None)
-                .await
-                .ok_or_else(|| {
-                    let error_msg =
-                        format!("Cannot get the fabric jar version for version {}", version);
-                    Error {
-                        kind: ErrorKind::BadRequest,
-                        source: eyre!(error_msg),
-                    }
-                })?,
-            super::Flavour::Paper { .. } => {
-                get_paper_jar_url(&version, &None).await.ok_or_else(|| {
-                    let error_msg =
-                        format!("Cannot get the paper jar version for version {}", version);
-                    Error {
-                        kind: ErrorKind::BadRequest,
-                        source: eyre!(error_msg),
-                    }
-                })?
-            }
-            super::Flavour::Spigot => todo!(),
-            super::Flavour::Forge { .. } => {
-                return Err(Error {
-                    kind: ErrorKind::UnsupportedOperation,
-                    source: eyre!("Changing versions is unsupported for forge servers"),
-                })
-            }
-        };
-        let lodestone_tmp = path_to_tmp().clone();
-        let temp_dir = tempfile::tempdir_in(lodestone_tmp).context("Failed to create temp dir")?;
-        download_file(
-            &url,
-            temp_dir.path(),
-            Some("server.jar"),
-            &Box::new(|_| {}),
-            true,
-        )
-        .await?;
-        let jar_path = temp_dir.path().join("server.jar");
-        crate::util::fs::rename(jar_path, self.path().await.join("server.jar")).await?;
-        self.config.lock().await.version = version;
-        self.write_config_to_file().await
+        self.update_loader(LoaderUpdate {
+            version,
+            loader_version: None,
+            installer_version: None,
+            build: None,
+        })
+        .await
     }
 
     async fn configurable_manifest(&self) -> ConfigurableManifest {
@@ -307,7 +461,9 @@ impl CmdArgSetting {
             CmdArgSetting::MaxRam(_) => {
                 "The maximum amount of RAM to allocate to the server instance"
             }
-            CmdArgSetting::JavaCmd(_) => "The command to use to run the java executable",
+            CmdArgSetting::JavaCmd(_) => {
+                "Full path to a Java binary, such as Adoptium or GraalVM. Used the next time this instance starts."
+            }
             CmdArgSetting::Args(_) => "The command line arguments to pass to the server",
         }
     }
@@ -563,6 +719,7 @@ pub(super) enum ServerPropertySetting {
     ResourcePackSha1(String),
     MaxWorldSize(u32),
     MaxBuildHeight(u32),
+    AcceptTransfer(bool),
     Unknown(String, String),
 }
 
@@ -1112,6 +1269,15 @@ impl From<ServerPropertySetting> for SettingManifest {
                 false,
                 true,
             ),
+            ServerPropertySetting::AcceptTransfer(inner_val) => Self::new_required_value(
+                value.get_identifier(),
+                value.get_name(),
+                value.get_description(),
+                ConfigurableValue::Boolean(inner_val),
+                None,
+                false,
+                true,
+            ),
             ServerPropertySetting::Unknown(_, ref val) => Self::new_required_value(
                 value.get_identifier(),
                 value.get_name(),
@@ -1406,6 +1572,9 @@ impl TryFrom<SettingManifest> for ServerPropertySetting {
                     .context(err_msg)?
                     .try_as_unsigned_integer()?,
             )),
+            "accept-transfer" => Ok(ServerPropertySetting::AcceptTransfer(
+                value.get_value().context(err_msg)?.try_as_boolean()?,
+            )),
             _ => Ok(ServerPropertySetting::Unknown(
                 value.get_identifier().to_string(),
                 value.get_value().context(err_msg)?.to_string(),
@@ -1479,6 +1648,7 @@ impl ServerPropertySetting {
             Self::ResourcePackSha1(_) => "resource-pack-sha1",
             Self::MaxWorldSize(_) => "max-world-size",
             Self::MaxBuildHeight(_) => "max-build-height",
+            Self::AcceptTransfer(_) => "accept-transfer",
             Self::Unknown(key, _) => key,
         }
         .to_string()
@@ -1552,6 +1722,7 @@ impl ServerPropertySetting {
             Self::ResourcePackSha1(_) => "Resource Pack Sha1",
             Self::MaxWorldSize(_) => "Max World Size",
             Self::MaxBuildHeight(_) => "Max Build Height",
+            Self::AcceptTransfer(_) => "Accept Transfer",
             Self::Unknown(_, _) => unreachable!("Handled above"),
         }
         .to_string()
@@ -1623,6 +1794,7 @@ impl ServerPropertySetting {
             Self::ResourcePackSha1(_) => "The SHA1 hash of the resource pack that will be used by default.",
             Self::MaxWorldSize(_) => "The maximum size of the world in blocks.",
             Self::MaxBuildHeight(_) => "The maximum height of the world in blocks.",
+            Self::AcceptTransfer(_) => "Whether this server accepts transfers from another server. If this is false, the server disconnects the client.",
             Self::Unknown(_, _) => unreachable!("Already handled above.")
         }.to_string()
     }
@@ -1817,6 +1989,11 @@ impl ServerPropertySetting {
                     || eyre!("Invalid value: {value} for \"hard-core\", expected bool"),
                 )?))
             }
+            "accept-transfer" => {
+                Ok(Self::AcceptTransfer(value.parse::<bool>().with_context(
+                    || eyre!("Invalid value: {value} for \"accept-transfer\", expected bool"),
+                )?))
+            }
             "white-list" => {
                 Ok(Self::WhiteList(value.parse::<bool>().with_context(
                     || eyre!("Invalid value: {value} for \"white-list\", expected bool"),
@@ -1941,6 +2118,7 @@ impl ServerPropertySetting {
             Self::ResourcePackSha1(v) => format!("{}={}", self.get_identifier(), v),
             Self::MaxWorldSize(v) => format!("{}={}", self.get_identifier(), v),
             Self::MaxBuildHeight(v) => format!("{}={}", self.get_identifier(), v),
+            Self::AcceptTransfer(v) => format!("{}={}", self.get_identifier(), v),
             Self::Unknown(_k, v) => format!("{}={}", self.get_identifier(), v),
         }
     }
@@ -1969,6 +2147,15 @@ mod test {
     use crate::traits::t_configurable::manifest::SectionManifest;
 
     use super::*;
+
+    #[test]
+    fn accept_transfer_has_a_description() {
+        let setting = ServerPropertySetting::from_key_val("accept-transfer", "false").unwrap();
+        assert_eq!(setting, ServerPropertySetting::AcceptTransfer(false));
+        let description = setting.get_description();
+        assert!(!description.is_empty());
+        assert!(!description.starts_with("Unknown"));
+    }
 
     #[test]
     fn test_parse_server_properties() {
@@ -2083,5 +2270,21 @@ mod test {
         );
 
         assert_eq!(property.to_line(), "resource-pack=".to_string());
+    }
+}
+
+#[cfg(test)]
+mod restart_flag_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::store_restart_on_crash;
+
+    #[test]
+    fn restart_flag_does_not_clobber_auto_start() {
+        let auto_start = AtomicBool::new(false);
+        let restart_on_crash = AtomicBool::new(false);
+        store_restart_on_crash(&auto_start, &restart_on_crash, true);
+        assert!(restart_on_crash.load(Ordering::Relaxed));
+        assert!(!auto_start.load(Ordering::Relaxed));
     }
 }

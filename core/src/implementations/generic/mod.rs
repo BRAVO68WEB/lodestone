@@ -138,6 +138,8 @@ impl GenericInstance {
                 None,
                 None,
                 Some(dot_lodestone_config.uuid().clone()),
+                String::new(),
+                0,
             )
             .await?;
         detach_future.await;
@@ -183,6 +185,8 @@ impl GenericInstance {
                 None,
                 None,
                 Some(dot_lodestone_config.uuid().clone()),
+                String::new(),
+                0,
             )
             .await?;
 
@@ -243,6 +247,8 @@ impl GenericInstance {
                 None,
                 None,
                 None,
+                String::new(),
+                0,
             )
             .await?;
 
@@ -292,6 +298,7 @@ impl TInstance for GenericInstance {
             player_count: self.get_player_count().await.ok(),
             max_player_count: self.get_max_player_count().await.ok(),
             player_list: self.get_player_list().await.ok(),
+            folder: crate::instance_folder::read_instance_folder(&self.path().await).await,
         }
     }
 }

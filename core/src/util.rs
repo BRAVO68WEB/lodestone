@@ -637,8 +637,34 @@ pub fn format_byte(mut bytes: u64) -> String {
     format!("{:.1} {}", bytes, unit)
 }
 
+/// Write bytes to `path` by writing a sibling temp file and renaming it into place.
+/// A crash during the write leaves the previous file intact.
+pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = tokio::fs::File::create(&tmp).await.context(format!(
+            "Failed to create temp file {}",
+            tmp.display()
+        ))?;
+        file.write_all(bytes).await.context(format!(
+            "Failed to write temp file {}",
+            tmp.display()
+        ))?;
+        file.sync_all()
+            .await
+            .context(format!("Failed to sync temp file {}", tmp.display()))?;
+    }
+    tokio::fs::rename(&tmp, path).await.context(format!(
+        "Failed to replace {} with {}",
+        path.display(),
+        tmp.display()
+    ))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::write_atomic;
     use crate::prelude::init_paths;
     use crate::util::{resolve_path_conflict, unzip_file, zip_files, UnzipOption};
     use std::collections::HashSet;
@@ -647,10 +673,24 @@ mod tests {
     use tokio;
 
     #[tokio::test]
+    async fn write_atomic_replaces_and_leaves_original_if_temp_is_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.json");
+        write_atomic(&path, br#"{"old":true}"#).await.unwrap();
+        write_atomic(&path, br#"{"new":true}"#).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"new":true}"#);
+
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"new":true}"#);
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "partial");
+    }
+
+    #[tokio::test]
     async fn test_unzip_file() {
         let temp_lodestone_path = tempfile::tempdir().unwrap();
         let temp_lodestone_path = temp_lodestone_path.path();
-        init_paths(temp_lodestone_path.to_path_buf());
+        init_paths(temp_lodestone_path.to_path_buf()).unwrap();
         let temp = tempdir::TempDir::new("test_unzip_file").unwrap();
         let temp_path = temp.path();
         let zip = PathBuf::from("testdata/sample.zip");
@@ -680,7 +720,7 @@ mod tests {
     async fn test_unzip_file_3() {
         let temp_lodestone_path = tempfile::tempdir().unwrap();
         let temp_lodestone_path = temp_lodestone_path.path();
-        init_paths(temp_lodestone_path.to_path_buf());
+        init_paths(temp_lodestone_path.to_path_buf()).unwrap();
         let temp = tempdir::TempDir::new("test_unzip_file").unwrap();
         let dest_path = temp.path().to_path_buf();
         let tar_gz = PathBuf::from("testdata/sample.gz");
@@ -712,7 +752,7 @@ mod tests {
     fn test_resolve_path_conflict() {
         let temp_lodestone_path = tempfile::tempdir().unwrap();
         let temp_lodestone_path = temp_lodestone_path.path();
-        init_paths(temp_lodestone_path.to_path_buf());
+        init_paths(temp_lodestone_path.to_path_buf()).unwrap();
         let temp = tempdir::TempDir::new("test_unzip_file").unwrap();
         let temp_path = temp.path();
         let txt_path = temp_path.join("test.txt");

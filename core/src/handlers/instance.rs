@@ -1,3 +1,4 @@
+use axum::extract::{DefaultBodyLimit, Multipart};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use axum::{extract::Path, Json};
@@ -392,6 +393,199 @@ pub async fn delete_instance(
     }
 }
 
+pub async fn import_instance_zip(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    AuthBearer(token): AuthBearer,
+    mut multipart: Multipart,
+) -> Result<Json<InstanceUuid>, Error> {
+    let requester = state.users_manager.read().await.try_auth_or_err(&token)?;
+    requester.try_action(
+        &UserAction::CreateInstance,
+        state.global_settings.lock().await.safe_mode(),
+    )?;
+    let mut name = String::new();
+    let temp_dir = tempfile::tempdir().context("Failed to create a temporary directory")?;
+    let zip_path = temp_dir.path().join("import.zip");
+    let mut saw_file = false;
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        match field.name() {
+            Some("name") => {
+                name = field.text().await.unwrap_or_default();
+            }
+            Some("file") => {
+                let mut out = tokio::fs::File::create(&zip_path)
+                    .await
+                    .context("Failed to store the import zip")?;
+                while let Some(chunk) = field.chunk().await.context("Failed to read the import zip")? {
+                    tokio::io::AsyncWriteExt::write_all(&mut out, &chunk)
+                        .await
+                        .context("Failed to store the import zip")?;
+                }
+                saw_file = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_file {
+        return Err(Error {
+            kind: ErrorKind::BadRequest,
+            source: eyre!("Choose a .zip file to import"),
+        });
+    }
+    finish_import(&state, requester, name, |dest| {
+        crate::instance_import::safe_unzip_to(&zip_path, dest)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct ImportDirectoryRequest {
+    pub source: String,
+    pub name: String,
+}
+
+pub async fn import_instance_directory(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    AuthBearer(token): AuthBearer,
+    Json(body): Json<ImportDirectoryRequest>,
+) -> Result<Json<InstanceUuid>, Error> {
+    let requester = state.users_manager.read().await.try_auth_or_err(&token)?;
+    requester.try_action(
+        &UserAction::CreateInstance,
+        state.global_settings.lock().await.safe_mode(),
+    )?;
+    let source = std::path::PathBuf::from(&body.source);
+    let lodestone = crate::prelude::lodestone_path();
+    if !crate::instance_import::path_is_inside(lodestone, &source) {
+        return Err(Error {
+            kind: ErrorKind::BadRequest,
+            source: eyre!("Import source must be inside the Lodestone data directory"),
+        });
+    }
+    finish_import(&state, requester, body.name, |dest| {
+        if crate::instance_import::path_is_inside(&source, dest)
+            || crate::instance_import::path_is_inside(dest, &source)
+        {
+            return Err(Error {
+                kind: ErrorKind::BadRequest,
+                source: eyre!("Refusing to copy a directory into itself"),
+            });
+        }
+        crate::instance_import::copy_tree(&source, dest)
+    })
+    .await
+}
+
+async fn finish_import(
+    state: &AppState,
+    requester: crate::auth::user::User,
+    name: String,
+    fill: impl FnOnce(&std::path::Path) -> Result<(), Error>,
+) -> Result<Json<InstanceUuid>, Error> {
+    let instance_uuid = InstanceUuid::default();
+    let display_name = {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            "imported".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let directory_name = crate::instance_import::import_directory_name(
+        &display_name,
+        &instance_uuid.no_prefix()[..8],
+    );
+    let dest = path_to_instances().join(directory_name);
+    let cleanup = || {
+        let _ = std::fs::remove_dir_all(&dest);
+    };
+    if let Err(err) = std::fs::create_dir_all(&dest) {
+        return Err(Error {
+            kind: ErrorKind::Internal,
+            source: err.into(),
+        });
+    }
+    if let Err(err) = fill(&dest) {
+        cleanup();
+        return Err(err);
+    }
+    if let Err(err) = crate::instance_import::hoist_single_server_dir(&dest) {
+        cleanup();
+        return Err(err);
+    }
+    let dot_lodestone_config = match crate::instance_import::write_import_files(
+        &dest,
+        &display_name,
+        instance_uuid.clone(),
+    ) {
+        Ok(config) => config,
+        Err(err) => {
+            cleanup();
+            return Err(err);
+        }
+    };
+    let minecraft_instance = match minecraft::MinecraftInstance::restore(
+        dest.clone(),
+        dot_lodestone_config,
+        state.event_broadcaster.clone(),
+        state.macro_executor.clone(),
+    )
+    .await
+    {
+        Ok(instance) => instance,
+        Err(err) => {
+            cleanup();
+            return Err(err);
+        }
+    };
+    let mut perm = requester.permissions.clone();
+    perm.can_start_instance.insert(instance_uuid.clone());
+    perm.can_stop_instance.insert(instance_uuid.clone());
+    perm.can_view_instance.insert(instance_uuid.clone());
+    perm.can_read_instance_file.insert(instance_uuid.clone());
+    perm.can_write_instance_file.insert(instance_uuid.clone());
+    let _ = state
+        .users_manager
+        .write()
+        .await
+        .update_permissions(&requester.uid, perm, CausedBy::System)
+        .await;
+    state
+        .instances
+        .insert(instance_uuid.clone(), minecraft_instance.into());
+    let caused_by = CausedBy::User {
+        user_id: requester.uid.clone(),
+        user_name: requester.username.clone(),
+    };
+    let (start, event_id) = Event::new_progression_event_start(
+        format!("Imported {display_name}"),
+        Some(1.0),
+        Some(ProgressionStartValue::InstanceCreation {
+            instance_uuid: instance_uuid.clone(),
+        }),
+        caused_by,
+    );
+    state.event_broadcaster.send(start);
+    let info = {
+        let instance = state
+            .instances
+            .get(&instance_uuid)
+            .ok_or_else(|| Error {
+                kind: ErrorKind::Internal,
+                source: eyre!("Imported instance disappeared"),
+            })?
+            .clone();
+        instance.get_instance_info().await
+    };
+    state.event_broadcaster.send(Event::new_progression_event_end(
+        event_id,
+        true,
+        Some("Instance imported"),
+        Some(ProgressionEndValue::InstanceCreation(info)),
+    ));
+    Ok(Json(instance_uuid))
+}
+
 pub fn get_instance_routes(state: AppState) -> Router {
     Router::new()
         .route("/instance/list", get(get_instance_list))
@@ -400,7 +594,13 @@ pub fn get_instance_routes(state: AppState) -> Router {
             post(create_minecraft_instance),
         )
         .route("/instance/create_generic", post(create_generic_instance))
+        .route("/instance/import", post(import_instance_zip))
+        .route(
+            "/instance/import/directory",
+            post(import_instance_directory),
+        )
         .route("/instance/:uuid", delete(delete_instance))
         .route("/instance/:uuid/info", get(get_instance_info))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }

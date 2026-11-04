@@ -213,7 +213,11 @@ pub fn get_instance_server_routes(state: AppState) -> Router {
         .route("/instance/:uuid/stop", put(stop_instance))
         .route("/instance/:uuid/restart", put(restart_instance))
         .route("/instance/:uuid/kill", put(kill_instance))
-        .route("/instance/:uuid/console", post(send_command))
+        .route(
+            "/instance/:uuid/console",
+            get(super::events::console_history).post(send_command),
+        )
+        .route("/instance/:uuid/shell", post(super::instance_shell::run_instance_shell))
         .route("/instance/:uuid/state", get(get_instance_state))
         .with_state(state)
 }

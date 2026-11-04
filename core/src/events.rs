@@ -28,6 +28,9 @@ pub struct EventQuery {
     pub event_instance_ids: Option<Vec<InstanceUuid>>,
     pub bearer_token: Option<String>,
     pub time_range: Option<TimeRange>,
+    /// Drop console lines. The console buffer is the place for those.
+    #[serde(default)]
+    pub exclude_console: bool,
 }
 
 impl EventQuery {
@@ -73,16 +76,45 @@ impl EventQuery {
             }
         }
         if let Some(event_instance_ids) = &self.event_instance_ids {
-            if let EventInner::InstanceEvent(instance_event) = &event.event_inner {
-                if !event_instance_ids.contains(&instance_event.instance_uuid) {
-                    return false;
-                }
-            } else {
-                return false;
+            match event_instance_uuid(&event.event_inner) {
+                Some(instance_uuid) if event_instance_ids.contains(&instance_uuid) => {}
+                _ => return false,
             }
+        }
+        if self.exclude_console && event.event_inner.is_console_message() {
+            return false;
         }
         // TODO might need to check time too
         true
+    }
+}
+
+/// Instance this event belongs to, including progression and macro events.
+pub fn event_instance_uuid(inner: &EventInner) -> Option<InstanceUuid> {
+    match inner {
+        EventInner::InstanceEvent(instance_event) => Some(instance_event.instance_uuid.clone()),
+        EventInner::MacroEvent(macro_event) => macro_event.instance_uuid.clone(),
+        EventInner::ProgressionEvent(progression) => match progression.progression_event_inner() {
+            ProgressionEventInner::ProgressionStart { inner, .. } => match inner {
+                Some(ProgressionStartValue::InstanceCreation { instance_uuid })
+                | Some(ProgressionStartValue::InstanceDelete { instance_uuid }) => {
+                    Some(instance_uuid.clone())
+                }
+                None => None,
+            },
+            ProgressionEventInner::ProgressionUpdate { .. } => None,
+            ProgressionEventInner::ProgressionEnd { inner, .. } => match inner {
+                Some(ProgressionEndValue::InstanceCreation(info)) => Some(info.uuid.clone()),
+                Some(ProgressionEndValue::InstanceDelete { instance_uuid })
+                | Some(ProgressionEndValue::FSOperationCompleted { instance_uuid, .. }) => {
+                    Some(instance_uuid.clone())
+                }
+                None => None,
+            },
+        },
+        EventInner::UserEvent(_) | EventInner::FSEvent(_) | EventInner::PlayitggRunnerEvent(_) => {
+            None
+        }
     }
 }
 
@@ -182,7 +214,31 @@ pub enum MacroEventInner {
 pub struct MacroEvent {
     pub instance_uuid: Option<InstanceUuid>,
     pub macro_pid: MacroPID,
+    /// Display name of the macro. Empty for internal workers such as a generic instance runtime.
+    #[serde(default)]
+    pub task_name: String,
+    /// Unix seconds when this run was created. `0` when the emitter has no task row.
+    #[serde(default)]
+    pub creation_time: i64,
     pub macro_event_inner: MacroEventInner,
+}
+
+impl MacroEvent {
+    pub fn new(
+        instance_uuid: Option<InstanceUuid>,
+        macro_pid: MacroPID,
+        task_name: impl Into<String>,
+        creation_time: i64,
+        macro_event_inner: MacroEventInner,
+    ) -> Self {
+        Self {
+            instance_uuid,
+            macro_pid,
+            task_name: task_name.into(),
+            creation_time,
+            macro_event_inner,
+        }
+    }
 }
 
 impl From<MacroEvent> for Event {
@@ -339,6 +395,20 @@ impl AsRef<EventInner> for EventInner {
     }
 }
 
+impl EventInner {
+    pub fn is_console_message(&self) -> bool {
+        match self {
+            EventInner::InstanceEvent(instance_event) => matches!(
+                &instance_event.instance_event_inner,
+                InstanceEventInner::InstanceOutput { .. }
+                    | InstanceEventInner::PlayerMessage { .. }
+                    | InstanceEventInner::SystemMessage { .. }
+            ),
+            _ => false,
+        }
+    }
+}
+
 #[test]
 fn event_type_export() {
     let _ = EventType::export();
@@ -408,15 +478,7 @@ impl AsRef<Event> for Event {
 
 impl Event {
     pub fn is_event_console_message(&self) -> bool {
-        match &self.event_inner {
-            EventInner::InstanceEvent(instance_event) => matches!(
-                &instance_event.instance_event_inner,
-                InstanceEventInner::InstanceOutput { .. }
-                    | InstanceEventInner::PlayerMessage { .. }
-                    | InstanceEventInner::SystemMessage { .. }
-            ),
-            _ => false,
-        }
+        self.event_inner.is_console_message()
     }
     pub fn try_player_message(&self) -> Option<(String, String)> {
         match &self.event_inner {
@@ -432,10 +494,7 @@ impl Event {
         }
     }
     pub fn get_instance_uuid(&self) -> Option<InstanceUuid> {
-        match &self.event_inner {
-            EventInner::InstanceEvent(instance_event) => Some(instance_event.instance_uuid.clone()),
-            _ => None,
-        }
+        event_instance_uuid(&self.event_inner)
     }
 
     pub fn try_macro_event(&self) -> Option<&MacroEvent> {
@@ -588,12 +647,127 @@ impl Event {
         Event {
             details: "".to_string(),
             snowflake: Snowflake::default(),
-            event_inner: EventInner::MacroEvent(MacroEvent {
+            event_inner: EventInner::MacroEvent(MacroEvent::new(
+                None,
                 macro_pid,
-                instance_uuid: None,
-                macro_event_inner: MacroEventInner::Detach,
-            }),
+                "",
+                0,
+                MacroEventInner::Detach,
+            )),
             caused_by: CausedBy::System,
         }
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use crate::auth::permission::UserPermission;
+    use crate::auth::user::User;
+    use crate::output_types::ClientEvent;
+    use crate::traits::t_server::State;
+
+    fn query_for(instance: &str) -> EventQuery {
+        EventQuery {
+            event_levels: None,
+            event_types: None,
+            instance_event_types: None,
+            user_event_types: None,
+            event_user_ids: None,
+            event_instance_ids: Some(vec![instance.to_string().into()]),
+            bearer_token: None,
+            time_range: None,
+            exclude_console: true,
+        }
+    }
+
+    fn state_event(uuid: &str) -> ClientEvent {
+        ClientEvent::from(Event::new_instance_state_transition(
+            uuid.to_string().into(),
+            "test".to_string(),
+            State::Running,
+        ))
+    }
+
+    #[test]
+    fn instance_filter_keeps_this_instance_and_drops_another() {
+        let query = query_for("INSTANCE_a");
+        assert!(query.filter(state_event("INSTANCE_a")));
+        assert!(!query.filter(state_event("INSTANCE_b")));
+    }
+
+    #[test]
+    fn instance_filter_includes_progression_for_that_instance() {
+        let query = query_for("INSTANCE_a");
+        let end = Event::new_progression_event_end(
+            ProgressionEventID(Snowflake::default()),
+            true,
+            Some("Created"),
+            Some(ProgressionEndValue::InstanceDelete {
+                instance_uuid: "INSTANCE_a".to_string().into(),
+            }),
+        );
+        let other = Event::new_progression_event_end(
+            ProgressionEventID(Snowflake::default()),
+            false,
+            Some("nope"),
+            Some(ProgressionEndValue::InstanceDelete {
+                instance_uuid: "INSTANCE_b".to_string().into(),
+            }),
+        );
+        assert!(query.filter(ClientEvent::from(end)));
+        assert!(!query.filter(ClientEvent::from(other)));
+    }
+
+    #[test]
+    fn exclude_console_drops_output_lines() {
+        let query = query_for("INSTANCE_a");
+        let line = ClientEvent::from(Event::new_instance_output(
+            "INSTANCE_a".to_string().into(),
+            "test".to_string(),
+            "hello".to_string(),
+        ));
+        assert!(!query.filter(line));
+    }
+
+    #[test]
+    fn non_owner_sees_progression_only_for_instances_they_can_view() {
+        let allowed = InstanceUuid::from("INSTANCE_a".to_string());
+        let other = InstanceUuid::from("INSTANCE_b".to_string());
+        let mut permissions = UserPermission::default();
+        permissions.can_view_instance.insert(allowed.clone());
+        let user = User::new("user".to_string(), "12345", false, false, permissions);
+        let progression = |uuid: InstanceUuid| {
+            Event::new_progression_event_end(
+                ProgressionEventID(Snowflake::default()),
+                false,
+                Some("disk full"),
+                Some(ProgressionEndValue::InstanceDelete {
+                    instance_uuid: uuid,
+                }),
+            )
+        };
+        assert!(user.can_see_event(&progression(allowed)));
+        assert!(!user.can_see_event(&progression(other)));
+    }
+
+    #[test]
+    fn macro_event_keeps_the_task_name_and_old_rows_still_parse() {
+        let event = MacroEvent::new(
+            None,
+            MacroPID(7),
+            "backup",
+            1_700_000_000,
+            MacroEventInner::Started,
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: MacroEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.task_name, "backup");
+        assert_eq!(parsed.creation_time, 1_700_000_000);
+
+        let old = r#"{"instance_uuid":null,"macro_pid":7,"macro_event_inner":{"type":"Started"}}"#;
+        let legacy: MacroEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(legacy.task_name, "");
+        assert_eq!(legacy.creation_time, 0);
     }
 }

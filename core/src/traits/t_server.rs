@@ -73,6 +73,72 @@ pub struct MonitorReport {
     pub start_time: Option<u64>,
 }
 
+/// Where a player is standing. Coordinates are already rounded to one decimal.
+/// `rcon_connected` is false when the instance has no RCON session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlayerLocation {
+    pub dimension: String,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub z: Option<f64>,
+    pub biome: String,
+    pub rcon_connected: bool,
+    pub message: Option<String>,
+}
+
+impl PlayerLocation {
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            dimension: "unknown".into(),
+            x: None,
+            y: None,
+            z: None,
+            biome: "unknown".into(),
+            rcon_connected: false,
+            message: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlayerItem {
+    pub slot: i32,
+    pub id: String,
+    pub count: u32,
+}
+
+/// Inventory, ender chest, and experience read over RCON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlayerInventory {
+    pub rcon_connected: bool,
+    pub message: Option<String>,
+    pub xp_level: Option<u32>,
+    pub xp_progress: Option<f32>,
+    pub inventory: Vec<PlayerItem>,
+    pub ender_chest: Vec<PlayerItem>,
+}
+
+impl PlayerInventory {
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            rcon_connected: false,
+            message: Some(message.into()),
+            xp_level: None,
+            xp_progress: None,
+            inventory: Vec::new(),
+            ender_chest: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerAction {
+    Kick { reason: String },
+    Clear { item: Option<String> },
+    Ban { reason: String },
+    WhitelistRemove,
+}
+
 impl ToString for State {
     fn to_string(&self) -> String {
         match self {
@@ -146,4 +212,7 @@ pub trait TServer {
     async fn state(&self) -> State;
     async fn send_command(&self, command: &str, caused_by: CausedBy) -> Result<(), Error>;
     async fn monitor(&self) -> MonitorReport;
+    async fn player_where(&self, name: &str) -> Result<PlayerLocation, Error>;
+    async fn player_inventory(&self, name: &str) -> Result<PlayerInventory, Error>;
+    async fn player_action(&self, name: &str, action: PlayerAction) -> Result<String, Error>;
 }

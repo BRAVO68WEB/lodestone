@@ -38,6 +38,14 @@ pub fn get_virtual_path(
 /// `to_virtual_path("/home/user/other/file.txt", "/home/user", "mount")` will return `Some("mount/other/file.txt")`
 ///
 /// This function is prone to backlinks, so it is recommended to use it with a path that is already validated
+/// `data` is a mount root. `data/world` is a path inside that mount.
+pub fn is_container_mount_root(relative_path: &Path) -> bool {
+    let Ok(safe) = scoped_join_win_safe("/", relative_path) else {
+        return true;
+    };
+    safe.components().count() <= 2
+}
+
 pub fn to_virtual_path(
     absolute_path: &Path,
     absolute_virtual_root: &Path,
@@ -65,5 +73,18 @@ mod tests {
         let mount_point = "mount";
         let virtual_path = to_virtual_path(absolute_path, virtual_root, mount_point).unwrap();
         assert_eq!(virtual_path, Path::new("mount/other/file.txt"));
+    }
+
+    #[test]
+    fn a_path_outside_the_mounts_is_rejected() {
+        let roots = [PathBuf::from("/user/other")];
+        assert!(get_virtual_path(&roots, Path::new("missing/file.txt")).is_none());
+        assert!(get_virtual_path(&roots, Path::new("../etc/passwd")).is_none());
+    }
+
+    #[test]
+    fn only_the_mount_name_is_the_mount_root() {
+        assert!(is_container_mount_root(Path::new("other")));
+        assert!(!is_container_mount_root(Path::new("other/file.txt")));
     }
 }

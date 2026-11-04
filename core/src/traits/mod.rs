@@ -35,6 +35,9 @@ pub struct InstanceInfo {
     pub player_count: Option<u32>,
     pub max_player_count: Option<u32>,
     pub player_list: Option<HashSet<Player>>,
+    /// Sidebar group. Empty when the instance is ungrouped.
+    #[serde(default)]
+    pub folder: String,
 }
 use crate::generic::GenericInstance;
 use crate::minecraft::MinecraftInstance;
@@ -59,6 +62,7 @@ pub trait TInstance: TConfigurable + TMacro + TPlayerManagement + TServer + Clon
             player_count: self.get_player_count().await.ok(),
             max_player_count: self.get_max_player_count().await.ok(),
             player_list: self.get_player_list().await.ok(),
+            folder: crate::instance_folder::read_instance_folder(&self.path().await).await,
         }
     }
 }

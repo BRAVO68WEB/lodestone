@@ -1,15 +1,20 @@
+mod stats;
 mod virtual_fs;
+pub use virtual_fs::is_container_mount_root;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bollard::container::{AttachContainerOptions, AttachContainerResults, ListContainersOptions};
+use bollard::container::{
+    AttachContainerOptions, AttachContainerResults, ListContainersOptions, MemoryStatsStats,
+    StatsOptions,
+};
 use bollard::{secret::EventMessage, system::EventsOptions, Docker};
-use color_eyre::eyre::{Context, ContextCompat};
+use color_eyre::eyre::{eyre, Context, ContextCompat};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_stream::StreamExt;
 use tracing::{error, info};
 use virtual_fs::{get_virtual_path, to_virtual_path};
@@ -18,12 +23,18 @@ use crate::handlers::global_fs::FileEntry;
 use crate::traits::t_configurable::Game::Generic;
 use crate::util::{list_dir, scoped_join_win_safe};
 use crate::{
-    error::Error,
+    error::{Error, ErrorKind},
     event_broadcaster::EventBroadcaster,
     events::Event,
-    traits::{t_configurable::GameType, t_server::State, InstanceInfo},
+    traits::{
+        t_configurable::GameType,
+        t_server::{MonitorReport, State},
+        InstanceInfo,
+    },
     types::InstanceUuid,
 };
+
+use stats::{docker_cpu_percent, docker_memory_bytes};
 
 #[derive(Debug, Clone)]
 pub struct DockerBridge {
@@ -31,6 +42,8 @@ pub struct DockerBridge {
     event_broadcaster: EventBroadcaster,
     watch_list: Arc<RwLock<HashSet<InstanceUuid>>>,
     db_file_path: PathBuf,
+    /// Previous CPU counters, so a one-shot stats read can show a real delta.
+    cpu_prev: Arc<Mutex<HashMap<InstanceUuid, (u64, u64)>>>,
 }
 
 fn docker_id_to_uuid(name: &str) -> InstanceUuid {
@@ -128,6 +141,55 @@ impl DockerBridge {
             db_file_path,
             event_broadcaster,
             watch_list,
+            cpu_prev: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub async fn watched_uuids(&self) -> Vec<InstanceUuid> {
+        self.watch_list.read().await.iter().cloned().collect()
+    }
+
+    /// Latest CPU and memory sample. The first call has no CPU delta yet.
+    pub async fn sample(&self, uuid: &InstanceUuid) -> Result<MonitorReport, Error> {
+        let name = uuid.to_string().replace("DOCKER-", "");
+        let mut stream = self.docker.stats(
+            &name,
+            Some(StatsOptions {
+                stream: false,
+                one_shot: true,
+            }),
+        );
+        let stats = stream
+            .next()
+            .await
+            .ok_or_else(|| Error {
+                kind: ErrorKind::NotFound,
+                source: eyre!("Docker returned no stats"),
+            })?
+            .map_err(|err| Error {
+                kind: ErrorKind::External,
+                source: err.into(),
+            })?;
+        let inactive = match stats.memory_stats.stats {
+            Some(MemoryStatsStats::V1(stats)) => stats.total_inactive_file,
+            Some(MemoryStatsStats::V2(stats)) => stats.inactive_file,
+            None => 0,
+        };
+        let cpu_total = stats.cpu_stats.cpu_usage.total_usage;
+        let system_total = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
+        let cpu_usage = {
+            let mut previous = self.cpu_prev.lock().await;
+            let usage = previous.get(uuid).and_then(|(prev_cpu, prev_system)| {
+                docker_cpu_percent(cpu_total, *prev_cpu, system_total, *prev_system)
+            });
+            previous.insert(uuid.clone(), (cpu_total, system_total));
+            usage
+        };
+        Ok(MonitorReport {
+            memory_usage: docker_memory_bytes(stats.memory_stats.usage, inactive),
+            disk_usage: None,
+            cpu_usage,
+            start_time: None,
         })
     }
 
@@ -165,6 +227,7 @@ impl DockerBridge {
                 player_count: None,
                 max_player_count: None,
                 player_list: None,
+                folder: String::new(),
             };
             ret.push(instance);
         }
@@ -283,6 +346,40 @@ impl DockerBridge {
         });
     }
 
+    /// Host path for a file inside one of the container's mounts.
+    /// `relative_path` starts with the mount name, such as `data/world/level.dat`.
+    pub async fn host_path(
+        &self,
+        uuid: &InstanceUuid,
+        relative_path: &Path,
+    ) -> Result<PathBuf, Error> {
+        let name = uuid.to_string().replace("DOCKER-", "");
+        let inspect = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .context("Failed to inspect container")?;
+        let virtual_roots: Vec<PathBuf> = inspect
+            .mounts
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|mount| mount.source.clone())
+            .map(PathBuf::from)
+            .collect();
+        if virtual_roots.is_empty() {
+            return Err(Error {
+                kind: ErrorKind::NotFound,
+                source: eyre!("Container has no mounted directories"),
+            });
+        }
+        get_virtual_path(&virtual_roots, relative_path)
+            .map(|(path, _, _)| path)
+            .ok_or_else(|| Error {
+                kind: ErrorKind::BadRequest,
+                source: eyre!("Path is outside the container mounts"),
+            })
+    }
+
     pub async fn list_files(
         &self,
         uuid: &InstanceUuid,
@@ -344,27 +441,7 @@ impl DockerBridge {
         uuid: &InstanceUuid,
         relative_path: PathBuf,
     ) -> Result<String, Error> {
-        let name = uuid.to_string().replace("DOCKER-", "");
-        let mounts = &self
-            .docker
-            .inspect_container(&name, None)
-            .await
-            .context("Failed to inspect container")?
-            .mounts;
-        if mounts.is_none() {
-            return Ok("".to_string());
-        }
-        let mounts = mounts.as_ref().unwrap();
-        if mounts.is_empty() {
-            return Ok("".to_string());
-        }
-        let virtual_roots: Vec<PathBuf> = mounts
-            .iter()
-            .filter_map(|m| m.source.as_ref())
-            .map(PathBuf::from)
-            .collect();
-        let (path, ..) = get_virtual_path(&virtual_roots, &relative_path).unwrap();
-
+        let path = self.host_path(uuid, &relative_path).await?;
         let content = tokio::fs::read_to_string(&path)
             .await
             .context("Failed to read file")?;
@@ -377,27 +454,7 @@ impl DockerBridge {
         relative_path: PathBuf,
         content: &[u8],
     ) -> Result<(), Error> {
-        let name = uuid.to_string().replace("DOCKER-", "");
-        let mounts = &self
-            .docker
-            .inspect_container(&name, None)
-            .await
-            .context("Failed to inspect container")?
-            .mounts;
-        if mounts.is_none() {
-            return Ok(());
-        }
-        let mounts = mounts.as_ref().unwrap();
-        if mounts.is_empty() {
-            return Ok(());
-        }
-        let virtual_roots: Vec<PathBuf> = mounts
-            .iter()
-            .filter_map(|m| m.source.as_ref())
-            .map(PathBuf::from)
-            .collect();
-        let (path, ..) = get_virtual_path(&virtual_roots, &relative_path).unwrap();
-
+        let path = self.host_path(uuid, &relative_path).await?;
         tokio::fs::write(&path, content)
             .await
             .context("Failed to write file")?;

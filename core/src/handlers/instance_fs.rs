@@ -48,6 +48,44 @@ static PROTECTED_EXTENSIONS: [&str; 10] = [
 
 static PROTECTED_DIR_NAME: [&str; 1] = ["mods"];
 
+async fn disk_path(
+    state: &AppState,
+    uuid: &InstanceUuid,
+    relative: impl AsRef<std::path::Path>,
+) -> Result<PathBuf, Error> {
+    if uuid.to_string().starts_with("DOCKER-") {
+        return state
+            .docker_bridge
+            .host_path(uuid, relative.as_ref())
+            .await;
+    }
+    let instance = state.instances.get(uuid).ok_or_else(|| Error {
+        kind: ErrorKind::NotFound,
+        source: eyre!("Instance not found"),
+    })?;
+    let root = instance.path().await;
+    drop(instance);
+    scoped_join_win_safe(root, relative)
+}
+
+/// Path of `child` relative to the instance. `scoped_join` canonicalizes the
+/// root, so on macOS a `/tmp` instance is listed under `/private/tmp`.
+pub fn instance_relative_path(
+    instance_root: &std::path::Path,
+    child: &std::path::Path,
+) -> Option<String> {
+    let stripped = child.strip_prefix(instance_root).ok().or_else(|| {
+        let canonical = instance_root.canonicalize().ok()?;
+        child.strip_prefix(canonical).ok()
+    })?;
+    let text = stripped.to_str()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
 fn is_path_protected(path: impl AsRef<std::path::Path>) -> bool {
     let path = path.as_ref();
     if path.is_dir() {
@@ -101,11 +139,7 @@ async fn list_instance_files(
         .filter_map(move |p| -> Option<FileEntry> {
             // remove the root path from the file path
             let mut r: FileEntry = p.as_path().into();
-            r.path = p
-                .strip_prefix(&root)
-                .ok()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_owned())?;
+            r.path = instance_relative_path(&root, p)?;
             Some(r)
         })
         .collect();
@@ -225,14 +259,7 @@ async fn make_instance_directory(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path = scoped_join_win_safe(root, relative_path)?;
-    // create the file if it doesn't exist
+    let path = disk_path(&state, &uuid, &relative_path).await?;
     crate::util::fs::create_dir_all(&path).await?;
 
     let caused_by = CausedBy::User {
@@ -268,19 +295,11 @@ async fn copy_instance_files(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    // join each path to the root
-    let paths_source = relative_paths_source
-        .iter()
-        .map(|p| scoped_join_win_safe(root.clone(), p))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let path_dest = scoped_join_win_safe(root, &relative_path_dest)?;
+    let mut paths_source = Vec::with_capacity(relative_paths_source.len());
+    for source in &relative_paths_source {
+        paths_source.push(disk_path(&state, &uuid, source).await?);
+    }
+    let path_dest = disk_path(&state, &uuid, &relative_path_dest).await?;
 
     if !requester.can_perform_action(&UserAction::WriteGlobalFile) && is_path_protected(&path_dest)
     {
@@ -414,21 +433,10 @@ async fn move_instance_file(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path_source = scoped_join_win_safe(&root, relative_path_source)?;
-    let path_dest = scoped_join_win_safe(&root, relative_path_dest)?;
-
-    let relative_path_source = path_source
-        .strip_prefix(&root)
-        .context("Error stripping prefix")?;
-    let relative_path_dest = path_dest
-        .strip_prefix(&root)
-        .context("Error stripping prefix")?;
+    let source_label = relative_path_source.clone();
+    let dest_label = relative_path_dest.clone();
+    let path_source = disk_path(&state, &uuid, &relative_path_source).await?;
+    let path_dest = disk_path(&state, &uuid, &relative_path_dest).await?;
 
     if !requester.can_perform_action(&UserAction::WriteInstanceFile(uuid.clone()))
         && (is_path_protected(&path_source) || is_path_protected(&path_dest))
@@ -453,8 +461,8 @@ async fn move_instance_file(
         .await
         .context(format!(
             "Error moving file from {} to {}",
-            relative_path_source.display(),
-            relative_path_dest.display()
+            source_label,
+            dest_label
         ))?;
 
     let caused_by = CausedBy::User {
@@ -484,14 +492,7 @@ async fn remove_instance_file(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path = scoped_join_win_safe(root, relative_path)?;
-    // if target has a protected extension, or no extension, deny
+    let path = disk_path(&state, &uuid, &relative_path).await?;
     if !requester.can_perform_action(&UserAction::WriteGlobalFile) && is_path_protected(&path) {
         return Err(Error {
             kind: ErrorKind::PermissionDenied,
@@ -524,18 +525,27 @@ async fn remove_instance_dir(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path = scoped_join_win_safe(&root, relative_path)?;
-    if path == root {
-        return Err(Error {
-            kind: ErrorKind::PermissionDenied,
-            source: eyre!("Cannot delete instance root"),
-        });
+    let path = disk_path(&state, &uuid, &relative_path).await?;
+    if uuid.to_string().starts_with("DOCKER-") {
+        if crate::docker_bridge::is_container_mount_root(std::path::Path::new(&relative_path)) {
+            return Err(Error {
+                kind: ErrorKind::PermissionDenied,
+                source: eyre!("Cannot delete a container mount"),
+            });
+        }
+    } else {
+        let instance = state.instances.get(&uuid).ok_or_else(|| Error {
+            kind: ErrorKind::NotFound,
+            source: eyre!("Instance not found"),
+        })?;
+        let root = instance.path().await;
+        drop(instance);
+        if path == root {
+            return Err(Error {
+                kind: ErrorKind::PermissionDenied,
+                source: eyre!("Cannot delete instance root"),
+            });
+        }
     }
     // if target has a protected extension, or no extension, deny
     if !requester.can_perform_action(&UserAction::WriteGlobalFile) && is_path_protected(&path) {
@@ -589,14 +599,7 @@ async fn new_instance_file(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path = scoped_join_win_safe(root, relative_path)?;
-    // if target has a protected extension, or no extension, deny
+    let path = disk_path(&state, &uuid, &relative_path).await?;
     if !requester.can_perform_action(&UserAction::WriteGlobalFile) && is_path_protected(&path) {
         return Err(Error {
             kind: ErrorKind::PermissionDenied,
@@ -629,13 +632,7 @@ async fn get_instance_file_url(
         &UserAction::ReadInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path = scoped_join_win_safe(&root, &relative_path)?;
+    let path = disk_path(&state, &uuid, &relative_path).await?;
 
     let downloadable_file = if fs::metadata(&path)
         .map_err(|_| Error {
@@ -718,13 +715,7 @@ async fn upload_instance_file(
         user_id: requester.uid.clone(),
         user_name: requester.username.clone(),
     };
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path_to_dir = scoped_join_win_safe(&root, relative_path)?;
+    let path_to_dir = disk_path(&state, &uuid, &relative_path).await?;
     crate::util::fs::create_dir_all(&path_to_dir).await?;
 
     let total = headers
@@ -853,13 +844,7 @@ pub async fn unzip_instance_file(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
-    let path_to_zip_file = scoped_join_win_safe(root, &relative_path)?;
+    let path_to_zip_file = disk_path(&state, &uuid, &relative_path).await?;
 
     if let UnzipOption::ToDir(ref dir) = unzip_option {
         if !requester.can_perform_action(&UserAction::WriteGlobalFile) && is_path_protected(dir) {
@@ -929,22 +914,15 @@ async fn zip_instance_files(
         &UserAction::WriteInstanceFile(uuid.clone()),
         state.global_settings.lock().await.safe_mode(),
     )?;
-    let instance = state.instances.get(&uuid).ok_or_else(|| Error {
-        kind: ErrorKind::NotFound,
-        source: eyre!("Instance not found"),
-    })?;
-    let root = instance.path().await;
-    drop(instance);
     let ZipRequest {
         mut target_relative_paths,
         mut destination_relative_path,
     } = zip_request;
 
-    // apply scoped_join_win_safe to all paths
     for path in &mut target_relative_paths {
-        *path = scoped_join_win_safe(&root, &*path)?;
+        *path = disk_path(&state, &uuid, &*path).await?;
     }
-    destination_relative_path = scoped_join_win_safe(&root, &destination_relative_path)?;
+    destination_relative_path = disk_path(&state, &uuid, &destination_relative_path).await?;
 
     if !requester.can_perform_action(&UserAction::ReadGlobalFile)
         && is_path_protected(&destination_relative_path)
@@ -1063,4 +1041,36 @@ pub fn get_instance_fs_routes(state: AppState) -> Router {
         )
         .route("/instance/:uuid/fs/zip", put(zip_instance_files))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_relative_path;
+
+    #[test]
+    fn a_listed_file_stays_relative_to_the_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.properties"), b"port=25565\n").unwrap();
+        let child = dir.path().join("server.properties");
+        assert_eq!(
+            instance_relative_path(dir.path(), &child).as_deref(),
+            Some("server.properties")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_instance_root_still_names_its_files() {
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir(real.path().join("world")).unwrap();
+        std::fs::write(real.path().join("world/level.dat"), b"world").unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("instance");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let child = real.path().canonicalize().unwrap().join("world/level.dat");
+        assert_eq!(
+            instance_relative_path(&link, &child).as_deref(),
+            Some("world/level.dat")
+        );
+    }
 }

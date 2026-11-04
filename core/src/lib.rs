@@ -18,8 +18,10 @@ use crate::{
         gateway::get_gateway_routes, global_fs::get_global_fs_routes,
         global_settings::get_global_settings_routes, instance::*,
         instance_config::get_instance_config_routes, instance_fs::get_instance_fs_routes,
-        instance_macro::get_instance_macro_routes, instance_players::get_instance_players_routes,
+        instance_macro::get_instance_macro_routes, instance_mods::get_instance_mod_routes,
+        instance_players::get_instance_players_routes,
         instance_server::get_instance_server_routes,
+        instance_backup::get_instance_backup_routes,
         instance_setup_configs::get_instance_setup_config_routes, monitor::get_monitor_routes,
         playitgg::get_playitgg_routes, setup::get_setup_route, system::get_system_routes,
         users::get_user_routes,
@@ -87,6 +89,9 @@ mod extension;
 pub mod global_settings;
 mod handlers;
 pub mod implementations;
+mod instance_folder;
+mod instance_import;
+mod instance_backup;
 pub mod macro_executor;
 mod migration;
 mod output_types;
@@ -98,6 +103,10 @@ mod traits;
 pub mod types;
 pub mod util;
 use handlers::global_fs::DownloadableFile;
+
+/// One sample per second. 2048 is the power-of-two ring that covers 30 minutes.
+const MONITOR_HISTORY: usize = 2048;
+const _: () = assert!(MONITOR_HISTORY.is_power_of_two() && MONITOR_HISTORY >= 1800);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -135,6 +144,32 @@ impl AppState {
     }
 }
 
+async fn prepare_duplicate_uuid(
+    path: &Path,
+    config: DotLodestoneConfig,
+    taken: impl Fn(&InstanceUuid) -> bool,
+) -> Result<DotLodestoneConfig, Error> {
+    if !taken(config.uuid()) {
+        return Ok(config);
+    }
+    let old = config.uuid().clone();
+    let mut new_uuid = InstanceUuid::default();
+    while taken(&new_uuid) || new_uuid == old {
+        new_uuid = InstanceUuid::default();
+    }
+    let updated = config.with_uuid(new_uuid.clone());
+    let bytes = serde_json::to_vec_pretty(&updated)
+        .context("Failed to serialize .lodestone_config")?;
+    crate::util::write_atomic(&path.join(".lodestone_config"), &bytes).await?;
+    warn!(
+        "UUID {} is repeated at {}. Assigned {}.",
+        old,
+        path.display(),
+        new_uuid
+    );
+    Ok(updated)
+}
+
 async fn restore_instances(
     instances_path: &Path,
     event_broadcaster: EventBroadcaster,
@@ -166,6 +201,20 @@ async fn restore_instances(
             Ok(v) => v,
             Err(e) => {
                 error!("Error while restoring instance {}, failed to parse .lodestone_config file : {e}", path.display());
+                continue;
+            }
+        };
+        let dot_lodestone_config = match prepare_duplicate_uuid(&path, dot_lodestone_config, |uuid| {
+            ret.contains_key(uuid)
+        })
+        .await
+        {
+            Ok(config) => config,
+            Err(e) => {
+                error!(
+                    "Error while restoring instance {}, failed to assign a unique uuid: {e}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -218,9 +267,6 @@ async fn restore_instances(
         };
         let uuid = uuid_instance.0;
         let instance = uuid_instance.1;
-        if ret.contains_key(&uuid) {
-            warn!("UUID {} is repeated.", uuid.to_string());
-        }
         ret.insert(uuid, instance);
     }
     Ok(ret)
@@ -400,6 +446,28 @@ pub struct Args {
     pub lodestone_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockDecision {
+    Held,
+    Busy,
+    Unsupported,
+}
+
+/// A contended lock means another Core is using this directory.
+/// Any other error means the filesystem cannot lock files, which is normal on CIFS/SMB.
+fn single_instance_lock(result: Result<(), std::io::Error>) -> LockDecision {
+    match result {
+        Ok(()) => LockDecision::Held,
+        Err(err) if lock_is_contended(&err) => LockDecision::Busy,
+        Err(_) => LockDecision::Unsupported,
+    }
+}
+
+fn lock_is_contended(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(err.raw_os_error(), Some(11) | Some(35))
+}
+
 pub async fn run(
     args: Args,
 ) -> Result<
@@ -439,7 +507,13 @@ pub async fn run(
             }
         })
     };
-    init_paths(lodestone_path.clone());
+    init_paths(lodestone_path.clone()).map_err(|e| Error {
+        kind: ErrorKind::Internal,
+        source: Report::msg(format!(
+            "Failed to create Lodestone directories in {}: {e}",
+            lodestone_path.display()
+        )),
+    })?;
     info!("Lodestone path: {}", lodestone_path.display());
     std::env::set_current_dir(&lodestone_path).map_err(|_| Error {
         kind: ErrorKind::Internal,
@@ -459,11 +533,19 @@ pub async fn run(
     let lockfile_path = lodestone_path.join("lodestone.lock");
     let lock_file =
         std::fs::File::create(lockfile_path.as_path()).expect("failed to create lockfile");
-    if lock_file.try_lock_exclusive().is_err() {
-        return Err(Error {
-            kind: ErrorKind::Internal,
-            source: Report::msg("Another instance of lodestone is running"),
-        });
+    match single_instance_lock(lock_file.try_lock_exclusive()) {
+        LockDecision::Held => {}
+        LockDecision::Busy => {
+            return Err(Error {
+                kind: ErrorKind::Internal,
+                source: Report::msg("Another instance of lodestone is running"),
+            });
+        }
+        LockDecision::Unsupported => {
+            warn!(
+                "This filesystem does not support file locks. Lodestone will start without a single-instance lock. Do not run two Cores on the same data directory."
+            );
+        }
     }
 
     let _ = migrate(&lodestone_path).map_err(|e| {
@@ -559,7 +641,9 @@ pub async fn run(
                 kind: ErrorKind::Internal,
                 source: Report::msg("Failed to create sqlite connection options"),
             })?
-            .create_if_missing(true),
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete)
+            .busy_timeout(Duration::from_secs(5)),
         )
         .await
         .map_err(|_| Error {
@@ -594,8 +678,16 @@ pub async fn run(
     let event_buffer_task = {
         let event_buffer = shared_state.events_buffer.clone();
         let console_out_buffer = shared_state.console_out_buffer.clone();
+        let console_pool = shared_state.sqlite_pool.clone();
         let mut event_receiver = tx.subscribe();
         async move {
+            let console_ready = match crate::db::console::init_console_events(&console_pool).await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!("Console history is unavailable: {err}");
+                    false
+                }
+            };
             loop {
                 let result = event_receiver.recv().await;
                 if let Err(error) = result.as_ref() {
@@ -618,6 +710,13 @@ pub async fn run(
                         .entry(event.get_instance_uuid().unwrap())
                         .or_insert_with(|| AllocRingBuffer::with_capacity(1024))
                         .push(event.clone());
+                    if console_ready {
+                        if let Err(err) =
+                            crate::db::console::record_console_event(&console_pool, &event).await
+                        {
+                            warn!("Failed to store a console line: {err}");
+                        }
+                    }
                 } else {
                     event_buffer.lock().await.push(event.clone());
                 }
@@ -630,6 +729,7 @@ pub async fn run(
     let monitor_report_task = {
         let monitor_buffer = shared_state.monitor_buffer.clone();
         let instances = shared_state.instances.clone();
+        let docker_bridge = shared_state.docker_bridge.clone();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
@@ -639,7 +739,22 @@ pub async fn run(
                         .lock()
                         .await
                         .entry(entry.key().to_owned())
-                        .or_insert_with(|| AllocRingBuffer::with_capacity(64))
+                        .or_insert_with(|| AllocRingBuffer::with_capacity(MONITOR_HISTORY))
+                        .push(report);
+                }
+                for uuid in docker_bridge.watched_uuids().await {
+                    let report = match docker_bridge.sample(&uuid).await {
+                        Ok(report) => report,
+                        Err(err) => {
+                            tracing::debug!("Docker stats for {uuid} failed: {err}");
+                            continue;
+                        }
+                    };
+                    monitor_buffer
+                        .lock()
+                        .await
+                        .entry(uuid)
+                        .or_insert_with(|| AllocRingBuffer::with_capacity(MONITOR_HISTORY))
                         .push(report);
                 }
                 interval.tick().await;
@@ -676,8 +791,10 @@ pub async fn run(
                     .merge(get_events_routes(shared_state.clone()))
                     .merge(get_instance_setup_config_routes(shared_state.clone()))
                     .merge(get_instance_server_routes(shared_state.clone()))
+                    .merge(get_instance_backup_routes(shared_state.clone()))
                     .merge(get_instance_config_routes(shared_state.clone()))
                     .merge(get_instance_players_routes(shared_state.clone()))
+                    .merge(get_instance_mod_routes(shared_state.clone()))
                     .merge(get_instance_routes(shared_state.clone()))
                     .merge(get_system_routes(shared_state.clone()))
                     .merge(get_checks_routes(shared_state.clone()))
@@ -807,4 +924,48 @@ pub async fn run(
         guard,
         shutdown_tx,
     ))
+}
+
+#[cfg(test)]
+mod duplicate_uuid_tests {
+    use super::prepare_duplicate_uuid;
+    use crate::traits::t_configurable::GameType;
+    use crate::types::{DotLodestoneConfig, InstanceUuid};
+
+    #[tokio::test]
+    async fn a_repeated_uuid_is_rewritten_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = InstanceUuid::default();
+        let config = DotLodestoneConfig::new(original.clone(), GameType::MinecraftJava);
+        let path = dir.path().join(".lodestone_config");
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let updated = prepare_duplicate_uuid(dir.path(), config, |uuid| uuid == &original)
+            .await
+            .unwrap();
+
+        assert_ne!(updated.uuid(), &original);
+        let on_disk: DotLodestoneConfig =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.uuid(), updated.uuid());
+        assert_ne!(on_disk.uuid(), &original);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::{single_instance_lock, LockDecision};
+
+    #[test]
+    fn a_contended_lock_stops_a_second_core() {
+        let err = std::io::Error::from_raw_os_error(11);
+        assert_eq!(single_instance_lock(Err(err)), LockDecision::Busy);
+    }
+
+    #[test]
+    fn an_unsupported_lock_still_starts() {
+        let err = std::io::Error::from_raw_os_error(37);
+        assert_eq!(single_instance_lock(Err(err)), LockDecision::Unsupported);
+        assert_eq!(single_instance_lock(Ok(())), LockDecision::Held);
+    }
 }

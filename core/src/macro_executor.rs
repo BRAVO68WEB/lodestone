@@ -310,6 +310,8 @@ impl MacroExecutor {
         pre_injection_code: Option<String>,
         permissions: Option<PermissionsOptions>,
         instance_uuid: Option<InstanceUuid>,
+        task_name: String,
+        creation_time: i64,
     ) -> Result<SpawnResult, Error> {
         let pid = MacroPID(self.next_process_id.fetch_add(1, Ordering::SeqCst));
         let exit_future = Box::pin({
@@ -332,12 +334,15 @@ impl MacroExecutor {
             let process_table = self.macro_process_table.clone();
             let event_broadcaster = self.event_broadcaster.clone();
             let rt = self.rt.clone();
+            let task_name = task_name;
+            let creation_time = creation_time;
             move || {
                 let _guard = rt.enter();
                 let local = LocalSet::new();
                 local.spawn_local({
                     let event_broadcaster = event_broadcaster.clone();
                     let instance_uuid = instance_uuid.clone();
+                    let task_name = task_name.clone();
                     async move {
                         let mut worker_option = worker_options_generator.generate();
                         worker_option.get_error_class_fn = Some(&deno_errors::get_error_class_name);
@@ -399,6 +404,8 @@ impl MacroExecutor {
                         event_broadcaster.send(
                             MacroEvent {
                                 macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                                 macro_event_inner: MacroEventInner::Started,
                                 instance_uuid: instance_uuid.clone(),
                             }
@@ -411,6 +418,8 @@ impl MacroExecutor {
                                 event_broadcaster.send(
                                     MacroEvent {
                                         macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                                         macro_event_inner: MacroEventInner::Stopped {
                                             exit_status: ExitStatus::Killed {
                                                 time: chrono::Utc::now().timestamp(),
@@ -425,6 +434,8 @@ impl MacroExecutor {
                                 event_broadcaster.send(
                                     MacroEvent {
                                         macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                                         macro_event_inner: MacroEventInner::Stopped {
                                             exit_status: ExitStatus::Error {
                                                 error_msg: e.to_string(),
@@ -445,6 +456,8 @@ impl MacroExecutor {
                                 event_broadcaster.send(
                                     MacroEvent {
                                         macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                                         macro_event_inner: MacroEventInner::Stopped {
                                             exit_status: ExitStatus::Killed {
                                                 time: chrono::Utc::now().timestamp(),
@@ -459,6 +472,8 @@ impl MacroExecutor {
                                 event_broadcaster.send(
                                     MacroEvent {
                                         macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                                         macro_event_inner: MacroEventInner::Stopped {
                                             exit_status: ExitStatus::Error {
                                                 error_msg: e.to_string(),
@@ -477,6 +492,8 @@ impl MacroExecutor {
                         event_broadcaster.send(
                             MacroEvent {
                                 macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                                 macro_event_inner: MacroEventInner::Stopped {
                                     exit_status: ExitStatus::Success {
                                         time: chrono::Utc::now().timestamp(),
@@ -499,6 +516,8 @@ impl MacroExecutor {
                 event_broadcaster.send(
                     MacroEvent {
                         macro_pid: pid,
+                                task_name: task_name.clone(),
+                                creation_time,
                         macro_event_inner: MacroEventInner::Stopped {
                             exit_status: ExitStatus::Error {
                                 time: chrono::Utc::now().timestamp(),
@@ -1056,6 +1075,8 @@ mod tests {
                 None,
                 None,
                 None,
+                "test".to_string(),
+                0,
             )
             .await
             .unwrap();
@@ -1098,6 +1119,8 @@ mod tests {
                 None,
                 None,
                 None,
+                "test".to_string(),
+                0,
             )
             .await
             .unwrap();

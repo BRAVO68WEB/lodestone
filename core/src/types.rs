@@ -54,6 +54,14 @@ impl Snowflake {
     pub fn new() -> Self {
         Self(get_snowflake())
     }
+
+    pub fn raw(self) -> i64 {
+        self.0
+    }
+
+    pub fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
 }
 
 impl ToString for Snowflake {
@@ -170,6 +178,11 @@ impl DotLodestoneConfig {
 
     pub fn uuid(&self) -> &InstanceUuid {
         &self.uuid
+    }
+
+    pub fn with_uuid(mut self, uuid: InstanceUuid) -> Self {
+        self.uuid = uuid;
+        self
     }
     pub fn creation_time(&self) -> i64 {
         self.creation_time

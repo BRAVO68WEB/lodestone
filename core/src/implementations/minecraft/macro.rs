@@ -152,6 +152,7 @@ impl TMacro for MinecraftInstance {
             None => None,
         };
 
+        let creation_time = chrono::Utc::now().timestamp();
         let SpawnResult { macro_pid: pid, .. } = self
             .macro_executor
             .spawn(
@@ -162,12 +163,14 @@ impl TMacro for MinecraftInstance {
                 config_code,
                 None,
                 Some(self.uuid.clone()),
+                name.to_string(),
+                creation_time,
             )
             .await?;
         let entry = TaskEntry {
             pid,
             name: name.to_string(),
-            creation_time: chrono::Utc::now().timestamp(),
+            creation_time,
         };
         self.pid_to_task_entry
             .lock()
