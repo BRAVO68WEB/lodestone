@@ -277,6 +277,7 @@ export const zipInstanceFiles = async (
       headers: {
         'Content-Type': 'application/json',
       },
+      timeout: 120000,
     })
   );
   if (error) {
@@ -303,6 +304,7 @@ export const unzipInstanceFile = async (
       headers: {
         'Content-Type': 'application/json',
       },
+      timeout: 120000,
     })
   );
 

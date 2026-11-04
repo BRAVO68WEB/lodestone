@@ -26,7 +26,7 @@ import {
 } from 'react';
 import { MacroEntry } from 'bindings/MacroEntry';
 import clsx from 'clsx';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import ConfirmDialog from 'components/Atoms/ConfirmDialog';
 import { ReactNode } from 'react';
@@ -90,13 +90,39 @@ const MacroModalContents = ({
   );
 };
 
+const unixToFormattedTime = (unix: string | undefined) => {
+  if (!unix || unix === '0') return 'N/A';
+  const date = new Date(parseInt(unix) * 1000);
+  if (Number.isNaN(date.getTime())) return 'N/A';
+  return `${date
+    .toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    })
+    .replace(/,/, '')} at ${date.toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  })}`;
+};
+
 export type MacrosPage = 'All Macros' | 'Running Tasks' | 'History';
 const Macros = () => {
   useDocumentTitle('Instance Macros - Lodestone');
   const { selectedInstance } = useContext(InstanceContext);
   const [macros, setMacros] = useState<TableRow[]>([]);
-  const [tasks, setTasks] = useState<TableRow[]>([]);
-  const [history, setHistory] = useState<TableRow[]>([]);
+  const instanceUuid = selectedInstance?.uuid ?? '';
+  const { data: taskEntries } = useQuery(
+    ['instance', instanceUuid, 'taskList'],
+    () => getTasks(instanceUuid),
+    { enabled: instanceUuid.length > 0 }
+  );
+  const { data: historyEntries } = useQuery(
+    ['instance', instanceUuid, 'history'],
+    () => getInstanceHistory(instanceUuid),
+    { enabled: instanceUuid.length > 0 }
+  );
   const [showMacroConfigModal, setShowMacroConfigModal] = useState(false);
   const [macroConfigContents, setMacroConfigContents] =
     useState<ReactNode>(null);
@@ -105,23 +131,28 @@ const Macros = () => {
   const [macroData, setMacroData] = useState<GetConfigResponse>();
   const [macroRow, setMacroRow] = useState<TableRow>();
 
-  const unixToFormattedTime = (unix: string | undefined) => {
-    if (!unix) return 'N/A';
-    const date = new Date(parseInt(unix) * 1000);
-    return `${date
-      .toLocaleDateString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      })
-      .replace(/,/, '')} at ${date.toLocaleTimeString(undefined, {
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    })}`;
-  };
-
   const queryClient = useQueryClient();
+  const tasks = useMemo(
+    () =>
+      (taskEntries ?? []).map((task, i) => ({
+        id: i + 1,
+        name: task.name,
+        creation_time: unixToFormattedTime(String(task.creation_time)),
+        pid: task.pid,
+      })),
+    [taskEntries]
+  );
+  const history = useMemo(
+    () =>
+      (historyEntries ?? []).map((entry, i) => ({
+        id: i + 1,
+        name: entry.task.name,
+        creation_time: unixToFormattedTime(String(entry.task.creation_time)),
+        finished: unixToFormattedTime(String(entry.exit_status.time)),
+        process_id: entry.task.pid,
+      })),
+    [historyEntries]
+  );
 
   const fetchMacros = async (instanceUuid: string) => {
     const response: MacroEntry[] = await getMacros(instanceUuid);
@@ -133,39 +164,6 @@ const Macros = () => {
             name: macro.name,
             last_run: unixToFormattedTime(macro.last_run?.toString()),
             path: macro.path,
-          } as TableRow)
-      )
-    );
-  };
-
-  const fetchTasks = async (instanceUuid: string) => {
-    const response = await getTasks(instanceUuid);
-    setTasks(
-      response.map(
-        (task, i) =>
-          ({
-            id: i + 1,
-            name: task.name,
-            creation_time: unixToFormattedTime(task.creation_time.toString()),
-            pid: task.pid,
-          } as TableRow)
-      )
-    );
-  };
-
-  const fetchHistory = async (instanceUuid: string) => {
-    const response = await getInstanceHistory(instanceUuid);
-    setHistory(
-      response.map(
-        (entry, i) =>
-          ({
-            id: i + 1,
-            name: entry.task.name,
-            creation_time: unixToFormattedTime(
-              entry.task.creation_time.toString()
-            ),
-            finished: unixToFormattedTime(entry.exit_status.time.toString()),
-            process_id: entry.task.pid,
           } as TableRow)
       )
     );
@@ -206,8 +204,6 @@ const Macros = () => {
     const fetchAll = async () => {
       if (!selectedInstance) return;
       fetchMacros(selectedInstance.uuid);
-      fetchTasks(selectedInstance.uuid);
-      fetchHistory(selectedInstance.uuid);
     };
 
     fetchAll();
@@ -262,7 +258,11 @@ const Macros = () => {
                   return newMacro;
                 });
                 setMacros(newMacros);
-                fetchTasks(selectedInstance.uuid);
+                queryClient.invalidateQueries([
+                  'instance',
+                  selectedInstance.uuid,
+                  'taskList',
+                ]);
               },
             },
             {
@@ -309,19 +309,13 @@ const Macros = () => {
                 await killTask(
                   queryClient,
                   selectedInstance.uuid,
-                  row.pid as string
+                  String(row.pid)
                 );
-                setTasks(tasks.filter((task) => task.id !== row.id)); //rather than refetching, we just update the display
-                const newHistory = {
-                  id: row.id,
-                  name: row.name,
-                  creation_time: row.creation_time,
-                  finished: unixToFormattedTime(
-                    Math.floor(Date.now() / 1000).toString()
-                  ), //unix time in seconds
-                  process_id: row.pid,
-                };
-                setHistory([newHistory, ...history]);
+                queryClient.setQueryData(
+                  ['instance', selectedInstance.uuid, 'taskList'],
+                  (old: { pid: number | string }[] | undefined) =>
+                    (old ?? []).filter((task) => String(task.pid) !== String(row.pid))
+                );
               },
             },
           ],

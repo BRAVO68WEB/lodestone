@@ -9,17 +9,17 @@ import {
   useNotificationReducer,
   useOngoingNotificationReducer,
 } from 'data/NotificationContext';
-import React, {
-  useContext,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useState,
-} from 'react';
+import React, { useContext, useEffect, useLayoutEffect, useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useLocalStorage } from 'usehooks-ts';
-import { useLocalStorageQueryParam } from 'utils/hooks';
-import { DEFAULT_LOCAL_CORE, errorToString, LODESTONE_PORT } from 'utils/util';
+import {
+  applyCoreBase,
+  coresMatch,
+  coreSocket,
+  errorToString,
+  initialCore,
+  persistCore,
+} from 'utils/util';
 import Dashboard from 'pages/dashboard';
 import Home from 'pages/home';
 import axios from 'axios';
@@ -46,6 +46,7 @@ import InstanceTabs from 'pages/InstanceTabs/InstanceTabs';
 import ProfilePage from 'pages/settings/profile';
 import CoreSettings from 'pages/settings/CoreSettings';
 import UserSettings from 'pages/settings/UserSettings';
+import HostFiles from 'pages/settings/HostFiles';
 
 
 const queryClient = new QueryClient({
@@ -62,6 +63,9 @@ const InstanceTabList = [
   'settings',
   'console',
   'files',
+  'backups',
+  'mods',
+  'shell',
   'macros',
   'logs',
   'playitgg',
@@ -79,6 +83,11 @@ export const CoreSettingsTabList = [
       path: 'users',
       content: <UserSettings />,
     },
+    {
+      title: 'Host files',
+      path: 'host',
+      content: <HostFiles />,
+    },
 ];
 
 export const AccountSettingsTabList = [
@@ -90,35 +99,15 @@ export const AccountSettingsTabList = [
 ];
 
 export default function App() {
-  const { location, setSearchParam } = useContext(BrowserLocationContext);
+  const { setSearchParam } = useContext(BrowserLocationContext);
 
   /* Start Core */
-  const [address, setAddress] = useLocalStorageQueryParam(
-    'address',
-    DEFAULT_LOCAL_CORE.address
-  );
-  const [port, setPort] = useLocalStorageQueryParam(
-    'port',
-    DEFAULT_LOCAL_CORE.port
-  );
-  const [protocol, setProtocol] = useLocalStorageQueryParam(
-    'protocol',
-    DEFAULT_LOCAL_CORE.protocol
-  );
-  const [apiVersion, setApiVersion] = useLocalStorageQueryParam(
-    'apiVersion',
-    DEFAULT_LOCAL_CORE.apiVersion
-  );
-  const core: CoreConnectionInfo = useMemo(
-    () => ({
-      address,
-      port,
-      protocol,
-      apiVersion,
-    }),
-    [address, port, protocol, apiVersion]
-  );
-  const socket = useMemo(() => `${address}:${port}`, [address, port]);
+  const [core, setCoreState] = useState<CoreConnectionInfo>(() => {
+    const next = initialCore();
+    applyCoreBase(next);
+    return next;
+  });
+  const socket = coreSocket(core);
   const [coreList, setCoreList] = useLocalStorage<CoreConnectionInfo[]>(
     'cores',
     []
@@ -129,31 +118,18 @@ export default function App() {
     queryClient.invalidateQueries();
     queryClient.clear();
     setSearchParam('instance', undefined);
-    //TODO: add core to the key of each query instead of invalidating all queries
-    setAddress(c.address);
-    setPort(c.port.toString());
-    setProtocol(c.protocol);
-    setApiVersion(c.apiVersion);
+    persistCore(c);
+    applyCoreBase(c);
+    setCoreConnectionStatus('loading');
+    setCoreState(c);
   };
 
   useEffect(() => {
     // we only want to add successful cores to the list
     if (coreConnectionStatus !== 'success') return;
-    // check if core is already in the list
-    // if it's exactly the same, do nothing
-    if (
-      coreList.some(
-        (c) =>
-          c.address === address &&
-          c.port === port &&
-          c.protocol === protocol &&
-          c.apiVersion === apiVersion
-      )
-    )
+    if (coreList.some((c) => coresMatch(c, core) && c.protocol === core.protocol && c.apiVersion === core.apiVersion))
       return;
-    const index = coreList.findIndex(
-      (c) => c.address === address && c.port === port
-    );
+    const index = coreList.findIndex((c) => coresMatch(c, core));
     if (index !== -1) {
       const newCoreList = [...coreList];
       newCoreList[index] = core;
@@ -162,23 +138,14 @@ export default function App() {
       setCoreList([...coreList, core]);
     }
 
-    // core and corelist left out on purpose
+    // coreList left out on purpose
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [address, apiVersion, core, port, protocol, coreConnectionStatus]);
-  useLayoutEffect(() => {
-    axios.defaults.baseURL = `${protocol}://${socket}/api/${apiVersion}`;
-    setCoreConnectionStatus('loading');
-  }, [apiVersion, protocol, socket]);
+  }, [core, coreConnectionStatus]);
 
   // Add the core to the list if it's not already there
   // Cores with the same address and port are considered the same
   const addCore = (c: CoreConnectionInfo) => {
-    if (
-      coreList.some(
-        (core) => core.address === c.address && core.port === c.port
-      )
-    )
-      return;
+    if (coreList.some((existing) => coresMatch(existing, c))) return;
     setCoreList([...coreList, c]);
   };
   /* End Core */

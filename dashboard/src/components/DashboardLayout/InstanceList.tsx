@@ -10,6 +10,55 @@ import { useContext, useEffect } from 'react';
 import useAnalyticsEventTracker from 'utils/hooks';
 import { match, otherwise } from 'variant';
 import { BrowserLocationContext } from 'data/BrowserLocationContext';
+import { groupInstances } from 'data/instanceFolders';
+import { InstanceInfo } from 'bindings/InstanceInfo';
+
+function InstanceGroups({
+  instances,
+}: {
+  instances: { [uuid: string]: InstanceInfo } | undefined;
+}) {
+  const groups = groupInstances(Object.values(instances ?? {}));
+  const named = groups.some((group) => group.folder !== '');
+  if (!named) {
+    return (
+      <>
+        <RadioGroup.Label className="text-small font-bold leading-snug text-gray-faded/30">
+          ALL INSTANCES
+        </RadioGroup.Label>
+        {(groups[0]?.items ?? []).map((instance) => (
+          <RadioGroup.Option
+            key={instance.uuid}
+            value={instance}
+            className="rounded-md outline-none child:w-full"
+          >
+            <InstancePill {...instance} />
+          </RadioGroup.Option>
+        ))}
+      </>
+    );
+  }
+  return (
+    <>
+      {groups.map((group) => (
+        <div key={group.folder || 'ungrouped'} className="flex flex-col gap-y-1">
+          <p className="mt-3 text-small font-bold leading-snug text-gray-faded/30">
+            {group.folder || 'Ungrouped'}
+          </p>
+          {group.items.map((instance) => (
+            <RadioGroup.Option
+              key={instance.uuid}
+              value={instance}
+              className="rounded-md outline-none child:w-full"
+            >
+              <InstancePill {...instance} />
+            </RadioGroup.Option>
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
 
 export default function InstanceList({
   className = '',
@@ -53,20 +102,8 @@ export default function InstanceList({
       value={selectedInstance}
       onChange={selectInstance}
     >
-      <RadioGroup.Label className="text-small font-bold leading-snug text-gray-faded/30">
-        ALL INSTANCES
-      </RadioGroup.Label>
       {userLoggedIn ? (
-        instances &&
-        Object.values(instances).map((instance) => (
-          <RadioGroup.Option
-            key={instance.uuid}
-            value={instance}
-            className="rounded-md outline-none child:w-full"
-          >
-            <InstancePill {...instance} />
-          </RadioGroup.Option>
-        ))
+        <InstanceGroups instances={instances} />
       ) : (
         <div
           className={`mt-2 flex w-fit select-none flex-col items-stretch gap-4 rounded-xl border-2 border-dashed border-gray-faded/10 py-4 px-6 text-medium font-bold tracking-tight`}

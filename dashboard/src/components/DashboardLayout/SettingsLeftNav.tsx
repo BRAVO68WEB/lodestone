@@ -7,7 +7,7 @@ import { RadioGroup } from '@headlessui/react';
 import { SettingsContext } from 'data/SettingsContext';
 import Avatar from 'components/Atoms/Avatar';
 import clsx from 'clsx';
-import { useUid } from 'data/UserInfo';
+import { useUid, useUserAuthorized } from 'data/UserInfo';
 import { AccountSettingsTabList, CoreSettingsTabList } from '../../../pages';
 
 
@@ -19,6 +19,10 @@ export default function SettingsLeftNav({ className }: { className?: string }) {
   useContext(SettingsContext);
   const setActive = useMemo(() => location.pathname.split('/')[2], [location.pathname]);
   const uid = useUid();
+  const canReadHost = useUserAuthorized('can_read_global_file');
+  const coreTabs = CoreSettingsTabList.filter(
+    (setting) => setting.path !== 'host' || canReadHost
+  );
 
   return (
     <div className={`flex w-full flex-col items-center px-4 ${className}`}>
@@ -49,7 +53,7 @@ export default function SettingsLeftNav({ className }: { className?: string }) {
             <FontAwesomeIcon icon={faServer} />
             CORE
           </RadioGroup.Label>
-          {CoreSettingsTabList.map((setting) => (
+          {coreTabs.map((setting) => (
           <RadioGroup.Option
               key={setting.path}
               value={`/settings/${setting.path}`}

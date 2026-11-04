@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import { InstanceContext } from 'data/InstanceContext';
 import { useLocation } from 'react-router-dom';
 import Label from 'components/Atoms/Label';
@@ -8,20 +8,28 @@ import { CommandHistoryContextProvider } from 'data/CommandHistoryContext';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import InstanceOverview from 'components/Instance/InstanceOverview';
 import {
+  faBoxArchive,
   faCarTunnel,
   faChartLine,
   faCodeCompare,
   faCog,
   faFolder,
   faInbox,
+  faPuzzlePiece,
   faServer,
+  faTerminal,
 } from '@fortawesome/free-solid-svg-icons';
 import GameConsole from 'components/GameConsole';
 import FileViewer from 'components/FileViewer';
-import DashboardCard from 'components/DashboardCard';
 import { InstanceSettingCard } from 'components/Instance';
 import Macros from 'pages/macros';
 import { PlayitggOverview } from 'components/PlayitggOverview';
+import InstanceEventLog from 'components/Instance/InstanceEventLog';
+import InstanceShell from 'components/Instance/InstanceShell';
+import InstanceBackups from 'components/Instance/InstanceBackups';
+import InstanceMods from 'components/Instance/InstanceMods';
+
+const tabScrollMemory = new Map<string, number>();
 
 export const tabs = [
   {
@@ -36,7 +44,7 @@ export const tabs = [
     title: 'Settings',
     displayTitle: 'Settings',
     path: 'settings',
-    width: 'max-w-2xl',
+    width: 'max-w-6xl',
     icon: <FontAwesomeIcon icon={faCog} />,
     content: (
       <div className="flex flex-col gap-8">
@@ -61,6 +69,30 @@ export const tabs = [
     content: <FileViewer />,
   },
   {
+    title: 'Backups',
+    displayTitle: 'Backups',
+    path: 'backups',
+    width: 'max-w-4xl',
+    icon: <FontAwesomeIcon icon={faBoxArchive} />,
+    content: <InstanceBackups />,
+  },
+  {
+    title: 'Mods',
+    displayTitle: 'Mods',
+    path: 'mods',
+    width: 'max-w-4xl',
+    icon: <FontAwesomeIcon icon={faPuzzlePiece} />,
+    content: <InstanceMods />,
+  },
+  {
+    title: 'Shell',
+    displayTitle: 'Shell',
+    path: 'shell',
+    width: 'max-w-4xl',
+    icon: <FontAwesomeIcon icon={faTerminal} />,
+    content: <InstanceShell />,
+  },
+  {
     title: 'Macros',
     displayTitle: 'Macros',
     path: 'macros',
@@ -74,19 +106,7 @@ export const tabs = [
     path: 'logs',
     width: 'max-w-4xl',
     icon: <FontAwesomeIcon icon={faInbox} />,
-    content: (
-      <DashboardCard className="grow justify-center gap-4">
-        <img
-          src="/assets/placeholder-cube.png"
-          alt="placeholder"
-          className="mx-auto w-20"
-          style={{ imageRendering: 'pixelated' }}
-        />
-        <p className="text-center font-medium text-white/50">
-          Coming soon to a dashboard near you!
-        </p>
-      </DashboardCard>
-    ),
+    content: <InstanceEventLog />,
   },
   {
     title: 'Playitgg',
@@ -117,6 +137,22 @@ const InstanceTabs = () => {
       setLoading(false);
     }, 1000);
   }, []);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollKey = `${uuid ?? ''}:${path}`;
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    node.scrollTop = tabScrollMemory.get(scrollKey) ?? 0;
+    const onScroll = () => {
+      tabScrollMemory.set(scrollKey, node.scrollTop);
+    };
+    node.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      tabScrollMemory.set(scrollKey, node.scrollTop);
+      node.removeEventListener('scroll', onScroll);
+    };
+  }, [scrollKey, loading]);
 
   if (!instance || !uuid) {
     if (loading) {
@@ -167,6 +203,7 @@ const InstanceTabs = () => {
         key={uuid}
       >
         <div
+          ref={scrollRef}
           className="gutter-stable -mx-3 flex grow flex-row items-stretch overflow-y-auto pl-4 pr-2"
           key={`${instance.name}-${tab.title}`}
         >
