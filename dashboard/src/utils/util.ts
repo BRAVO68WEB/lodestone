@@ -25,7 +25,211 @@ export const DEFAULT_LOCAL_CORE: CoreConnectionInfo = {
   port: LODESTONE_PORT.toString(),
   protocol: 'http',
   apiVersion: 'v1',
+  sameOrigin: false,
 };
+
+export const CORE_STORAGE_KEY = 'lodestone-core';
+
+declare global {
+  interface Window {
+    __LODESTONE_SAME_ORIGIN__?: boolean;
+  }
+}
+
+export function sameOriginEnabled(): boolean {
+  return typeof window !== 'undefined' && window.__LODESTONE_SAME_ORIGIN__ === true;
+}
+
+export function sameOriginCore(): CoreConnectionInfo {
+  const protocol =
+    typeof window !== 'undefined'
+      ? window.location.protocol.replace(':', '')
+      : 'http';
+  return {
+    address: typeof window !== 'undefined' ? window.location.hostname : '',
+    port: typeof window !== 'undefined' ? window.location.port : '',
+    protocol: protocol === 'https' ? 'https' : 'http',
+    apiVersion: 'v1',
+    sameOrigin: true,
+  };
+}
+
+function readLocalString(key: string): string | null {
+  const raw = localStorage.getItem(key);
+  if (raw == null || raw === '') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === 'string' ? parsed : null;
+  } catch {
+    return raw;
+  }
+}
+
+function isAutomaticLocalhost(address: string): boolean {
+  return address === 'localhost' || address === '127.0.0.1' || address === '::1';
+}
+
+/** A core the user chose. The old localhost default is not a choice. */
+export function readSavedCore(): CoreConnectionInfo | null {
+  if (typeof window === 'undefined') return null;
+  const raw = localStorage.getItem(CORE_STORAGE_KEY);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as CoreConnectionInfo;
+      if (parsed?.sameOrigin) return null;
+      if (parsed && typeof parsed.address === 'string' && parsed.address) {
+        return {
+          address: parsed.address,
+          port: String(parsed.port || LODESTONE_PORT),
+          protocol: parsed.protocol === 'https' ? 'https' : 'http',
+          apiVersion: parsed.apiVersion || 'v1',
+          sameOrigin: false,
+        };
+      }
+    } catch {
+      // fall through to the old keys
+    }
+  }
+  const address = readLocalString('address');
+  if (!address || isAutomaticLocalhost(address)) return null;
+  return {
+    address,
+    port: readLocalString('port') || LODESTONE_PORT.toString(),
+    protocol: readLocalString('protocol') === 'https' ? 'https' : 'http',
+    apiVersion: readLocalString('apiVersion') || 'v1',
+    sameOrigin: false,
+  };
+}
+
+export function initialCore(): CoreConnectionInfo {
+  const saved = readSavedCore();
+  if (saved) return saved;
+  if (sameOriginEnabled()) return sameOriginCore();
+  return { ...DEFAULT_LOCAL_CORE };
+}
+
+export function persistCore(core: CoreConnectionInfo) {
+  if (typeof window === 'undefined') return;
+  if (core.sameOrigin) {
+    localStorage.removeItem(CORE_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(
+    CORE_STORAGE_KEY,
+    JSON.stringify({
+      address: core.address,
+      port: String(core.port || LODESTONE_PORT),
+      protocol: core.protocol || 'http',
+      apiVersion: core.apiVersion || 'v1',
+      sameOrigin: false,
+    })
+  );
+}
+
+export function coreSocket(core: CoreConnectionInfo): string {
+  if (core.sameOrigin) return 'same-origin';
+  return `${core.address}:${core.port}`;
+}
+
+export function coreLabel(core: CoreConnectionInfo): string {
+  if (core.sameOrigin) {
+    if (typeof window === 'undefined') return 'This server';
+    return window.location.host || 'This server';
+  }
+  return `${core.address}:${core.port}`;
+}
+
+export function coreApiBase(core: CoreConnectionInfo): string {
+  const version = core.apiVersion || 'v1';
+  if (core.sameOrigin && typeof window !== 'undefined') {
+    return new URL(`/api/${version}`, window.location.origin).href.replace(
+      /\/$/,
+      ''
+    );
+  }
+  const protocol = core.protocol === 'https' ? 'https' : 'http';
+  const port = core.port ? `:${core.port}` : '';
+  return `${protocol}://${core.address}${port}/api/${version}`;
+}
+
+export function coreWsBase(core: CoreConnectionInfo): string {
+  const version = core.apiVersion || 'v1';
+  if (core.sameOrigin && typeof window !== 'undefined') {
+    const url = new URL(`/api/${version}`, window.location.origin);
+    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return url.href.replace(/\/$/, '');
+  }
+  const protocol = core.protocol === 'https' ? 'wss' : 'ws';
+  const port = core.port ? `:${core.port}` : '';
+  return `${protocol}://${core.address}${port}/api/${version}`;
+}
+
+export function applyCoreBase(core: CoreConnectionInfo) {
+  axios.defaults.baseURL = coreApiBase(core);
+}
+
+/**
+ * Accept a host, host:port, or a full http(s) URL.
+ * The port and protocol fields are the fallback when the address is only a host.
+ */
+export function parseCoreInput(
+  addressField: string,
+  fallback: CoreConnectionInfo
+): CoreConnectionInfo {
+  const trimmed = addressField.trim();
+  const base: CoreConnectionInfo = {
+    address: trimmed,
+    port: String(fallback.port || LODESTONE_PORT),
+    protocol: fallback.protocol === 'https' ? 'https' : 'http',
+    apiVersion: fallback.apiVersion || 'v1',
+    sameOrigin: false,
+  };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    const url = new URL(trimmed);
+    const protocol = url.protocol === 'https:' ? 'https' : 'http';
+    let address = url.hostname;
+    if (address.includes(':')) address = `[${address}]`;
+    return {
+      ...base,
+      address,
+      protocol,
+      port:
+        url.port ||
+        (protocol === 'https' ? '443' : String(fallback.port || LODESTONE_PORT)),
+    };
+  }
+  const bracketed = trimmed.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (bracketed) {
+    return {
+      ...base,
+      address: `[${bracketed[1]}]`,
+      port: bracketed[2] || base.port,
+    };
+  }
+  const colon = trimmed.lastIndexOf(':');
+  if (
+    colon > 0 &&
+    !trimmed.startsWith('[') &&
+    /^\d+$/.test(trimmed.slice(colon + 1))
+  ) {
+    let address = trimmed.slice(0, colon);
+    if (address.includes(':')) address = `[${address}]`;
+    return {
+      ...base,
+      address,
+      port: trimmed.slice(colon + 1),
+    };
+  }
+  if (trimmed.includes(':') && !trimmed.startsWith('[')) {
+    return { ...base, address: `[${trimmed}]` };
+  }
+  return base;
+}
+
+export function coresMatch(a: CoreConnectionInfo, b: CoreConnectionInfo): boolean {
+  if (a.sameOrigin || b.sameOrigin) return Boolean(a.sameOrigin) && Boolean(b.sameOrigin);
+  return a.address === b.address && String(a.port) === String(b.port);
+}
 export const myTwMerge = extendTailwindMerge({
   classGroups: {
     'font-size': [

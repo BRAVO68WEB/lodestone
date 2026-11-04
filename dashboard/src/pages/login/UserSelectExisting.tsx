@@ -15,14 +15,13 @@ import Avatar from 'components/Atoms/Avatar';
 import { useDocumentTitle, useEffectOnce } from 'usehooks-ts';
 import { tauri } from 'utils/tauriUtil';
 import { JwtToken } from 'bindings/JwtToken';
-import { isLocalCore } from 'utils/util';
+import { coreLabel, coreSocket, isLocalCore } from 'utils/util';
 
 const UserSelectExisting = () => {
   useDocumentTitle('Select user - Lodestone');
   const { setPathname, navigateBack } = useContext(BrowserLocationContext);
   const { setToken, token, core } = useContext(LodestoneContext);
-  const { address, port } = core;
-  const socket = `${address}:${port}`;
+  const socket = coreSocket(core);
   const { data: coreInfo } = useCoreInfo();
   const { core_name, is_setup } = coreInfo ?? {};
   const { data: userInfo, isLoading: isUserInfoLoading } = useUserInfo();
@@ -54,7 +53,7 @@ const UserSelectExisting = () => {
           Sign in
         </h1>
         <h2 className="text-h3 font-medium tracking-medium text-white/50">
-          {core_name} ({socket})
+          {core_name} ({coreLabel(core)})
         </h2>
       </div>
       <div className="flex flex-row items-baseline gap-8">

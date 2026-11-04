@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 // eslint-disable-next-line no-restricted-imports -- this is the only place that should import useNavigate
 import { useLocation, useNavigate, Location } from 'react-router-dom';
 
@@ -47,17 +47,19 @@ export const BrowserLocationContextProvider = ({
 }: {
   children: React.ReactNode;
 }) => {
-  // location is let since we want to manually update it
-  let location = useLocation();
+  const location = useLocation();
+  const locationRef = useRef(location);
+  locationRef.current = location;
   const navigate = useNavigate();
   const setLocation = (func: (loc: Location) => Location, replace = false) => {
-    const newLocation = func(location);
-    console.log('setLocation', {...location}, {...newLocation});
-    location = newLocation;
-    navigate(location, { replace });
+    const current = locationRef.current;
+    const newLocation = func(current);
+    console.log('setLocation', {...current}, {...newLocation});
+    locationRef.current = newLocation;
+    navigate(newLocation, { replace });
   };
   const setPathname = (pathname: string, replace = false) => {
-    if(pathname === location.pathname) return;
+    if(pathname === locationRef.current.pathname) return;
     setLocation((loc) => ({ ...loc, pathname }), replace);
   };
   const setSearchParam = (key: string, value: string | undefined, replace = false) => {

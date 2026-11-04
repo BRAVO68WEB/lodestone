@@ -15,6 +15,7 @@ import {
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import IconButton from './Atoms/IconButton';
 import { useLocation } from 'react-router-dom';
+import { coreSocket } from 'utils/util';
 
 export type UserState = 'loading' | 'logged-in' | 'logged-out';
 
@@ -25,8 +26,7 @@ const UserMenu = () => {
   const uid = useUid();
   const { isLoading, isError, data: user } = useUserInfo();
   const [userState, setUserState] = useState<UserState>('logged-out');
-  const { address, port } = core;
-  const socket = `${address}:${port}`;
+  const socket = coreSocket(core);
 
   useEffect(() => {
     if (!token) {

@@ -1,0 +1,13 @@
+services:
+  lodestone:
+    image: ghcr.io/bravo68web/lodestone:latest
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      # Publish each game port the instance uses. Nginx does not proxy these.
+      - "25565:25565"
+    volumes:
+      - lodestone:/var/lib/lodestone
+
+volumes:
+  lodestone:

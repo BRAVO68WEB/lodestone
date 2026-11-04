@@ -24,6 +24,8 @@ export interface CoreConnectionInfo {
   port: string;
   protocol: string;
   apiVersion: string;
+  /** When true, API and websocket calls use the page origin. Nginx proxies /api to Core. */
+  sameOrigin?: boolean;
 }
 
 export const LodestoneContext = createContext<LodestoneContext>({

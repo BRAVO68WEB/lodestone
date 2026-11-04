@@ -75,49 +75,14 @@ You should not download Lodestone Core directly due to its lack of ability to se
 
 ### Using Docker Image
 
-As of v0.4.3 we have added Docker support to lodestone core.
-Our precompiled images will be based on the newest release available from: `ghcr.io/lodestone-team/lodestone_core`.
-Alternatively, you may build your own image using the default `Dockerfile`, not additional arguments required.
+The supported image is `ghcr.io/bravo68web/lodestone`. It serves the dashboard on port 80 and proxies `/api` to Core inside the container. Publish game ports yourself.
 
-> **Note**
-> You may add additional ports as you wish to forward, but 16662 is the default port served in the image.
-> You may add a volume for your lodestone instance to be accessible, in the example below, you can create a volume first by using `docker volume create lodestone`.
-
-Docker CLI example:
 ```sh
-docker run -d \
-  --name lodestone \
-  --restart unless-stopped \
-  -p 16662:16662 \
-  -v lodestone:/home/user/.lodestone \
-  ghcr.io/lodestone-team/lodestone_core
-```
-Docker Compose example:
-
-Download the docker-compose.yml file from this repo using
-```sh
-wget https://raw.githubusercontent.com/Lodestone-Team/lodestone_core/main/docker-compose.yml
-```
-and then run it using
-```sh
+docker pull ghcr.io/bravo68web/lodestone
 docker compose up -d
 ```
-Alternatively, create docker-compose.yml yourself:
-```yml
-version: '3.8'
-services:
-  lodestone:
-    container_name: lodestone
-    image: ghcr.io/lodestone-team/lodestone_core
-    restart: unless-stopped
-    ports:
-      - "16662:16662"
-    volumes:
-      - lodestone:/home/user/.lodestone
 
-volumes:
-  lodestone:
-```
+Use the `docker-compose.yml` at the repository root (port `8080` for the UI, `25565` for Minecraft). Data is stored in the `lodestone` volume at `/var/lib/lodestone`.
 
 <!-- GETTING STARTED -->
 ## Getting Started (development)

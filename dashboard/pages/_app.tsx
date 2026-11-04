@@ -14,7 +14,7 @@ import ReactGA from 'react-ga4';
 import localFont from '@next/font/local';
 
 config.autoAddCss = false;
-axios.defaults.timeout = 5000;
+axios.defaults.timeout = 30000;
 const TRACKING_ID = 'G-LZQ3VZ6N26';
 if (process.env.NODE_ENV === 'production') ReactGA.initialize(TRACKING_ID);
 

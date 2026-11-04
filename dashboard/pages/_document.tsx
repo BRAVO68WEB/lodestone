@@ -5,6 +5,9 @@ class MyDocument extends Document {
     return (
       <Html>
         <Head>
+          {/* Runs before the app bundle so same-origin mode is set on first paint. */}
+          {/* eslint-disable-next-line @next/next/no-sync-scripts */}
+          <script src="/config.js" />
         </Head>
 
         <body>

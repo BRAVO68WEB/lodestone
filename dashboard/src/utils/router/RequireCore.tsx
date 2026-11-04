@@ -9,6 +9,7 @@ export default function RequireCore({
   children: React.ReactNode;
   redirect?: string;
 }) {
-  const { coreList } = useContext(LodestoneContext);
-  return coreList.length > 0 ? <>{children}</> : <MyNavigate to={redirect} />;
+  const { coreList, core } = useContext(LodestoneContext);
+  const hasCore = coreList.length > 0 || Boolean(core.sameOrigin);
+  return hasCore ? <>{children}</> : <MyNavigate to={redirect} />;
 }

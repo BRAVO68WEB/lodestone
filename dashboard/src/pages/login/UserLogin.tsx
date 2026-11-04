@@ -7,7 +7,7 @@ import * as yup from 'yup';
 import { useCoreInfo } from 'data/SystemInfo';
 import { faArrowLeft, faArrowRight } from '@fortawesome/free-solid-svg-icons';
 import { BrowserLocationContext } from 'data/BrowserLocationContext';
-import { DISABLE_AUTOFILL, isLocalCore } from 'utils/util';
+import { coreLabel, coreSocket, DISABLE_AUTOFILL, isLocalCore } from 'utils/util';
 import { loginToCore } from 'utils/apis';
 import { tauri } from 'utils/tauriUtil';
 import { useDocumentTitle } from 'usehooks-ts';
@@ -27,8 +27,7 @@ const UserLogin = () => {
   useDocumentTitle('Sign in - Lodestone');
   const { setPathname, navigateBack } = useContext(BrowserLocationContext);
   const { setToken, core } = useContext(LodestoneContext);
-  const { address, port } = core;
-  const socket = `${address}:${port}`;
+  const socket = coreSocket(core);
   const { data: coreInfo } = useCoreInfo();
   const { core_name } = coreInfo ?? {};
   const gaEventTracker = useAnalyticsEventTracker('User Login');
@@ -70,7 +69,7 @@ const UserLogin = () => {
           Sign in
         </h1>
         <h2 className="text-medium font-medium tracking-medium text-white/50">
-          {core_name} ({socket})
+          {core_name} ({coreLabel(core)})
         </h2>
       </div>
       <Formik

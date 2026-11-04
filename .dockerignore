@@ -1,0 +1,9 @@
+.git
+**/*.db
+!dev.db
+!core/dev.db
+!core/test.db
+**/target
+dashboard/node_modules
+dashboard/.next
+dashboard/out

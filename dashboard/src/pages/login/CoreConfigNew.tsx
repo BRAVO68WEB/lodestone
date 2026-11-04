@@ -2,6 +2,7 @@ import Button from 'components/Atoms/Button';
 import { useContext } from 'react';
 import {
   axiosPutSingleValue,
+  coreLabel,
   DISABLE_AUTOFILL,
   errorToString,
 } from 'utils/util';
@@ -30,8 +31,6 @@ const CoreConfigNew = () => {
   useDocumentTitle('Configure new core - Lodestone');
   const { navigateBack, setPathname } = useContext(BrowserLocationContext);
   const { core } = useContext(LodestoneContext);
-  const { address, port } = core;
-  const socket = `${address}:${port}`;
   const { data: coreInfo } = useCoreInfo();
   const { core_name } = coreInfo ?? {};
   const queryClient = useQueryClient();
@@ -85,7 +84,7 @@ const CoreConfigNew = () => {
           Customize your core
         </h1>
         <h2 className="text-h3 font-bold tracking-medium text-white/50">
-          {core_name} ({socket})
+          {core_name} ({coreLabel(core)})
         </h2>
       </div>
       <Formik
@@ -103,7 +102,12 @@ const CoreConfigNew = () => {
             autoComplete={DISABLE_AUTOFILL}
           >
             <div className="grid grid-cols-1 gap-y-14 gap-x-8 @lg:grid-cols-2">
-              <InputField type="text" name="coreName" label="Core Name" />
+              <InputField
+                type="text"
+                name="coreName"
+                label="Core Name"
+                hint="A name for this Lodestone Core. It is shown in the top bar and in the core list. It is not a Minecraft server name."
+              />
               <InputField
                 type="text"
                 name="domain"

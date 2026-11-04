@@ -1,0 +1,119 @@
+name: Release Docker
+
+# Publishes ghcr.io/bravo68web/lodestone from the bravo68web/lodestone fork.
+# A stable GitHub release gets :latest and :latest-stable.
+# A prerelease gets :latest-beta and does not move :latest.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version tag, without a leading v"
+        required: true
+        type: string
+      stable:
+        description: "Also push latest and latest-stable"
+        required: true
+        type: boolean
+
+env:
+  IMAGE: ghcr.io/bravo68web/lodestone
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    if: github.repository == 'bravo68web/lodestone'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            suffix: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: image version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - name: build and push arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.version }}-${{ matrix.suffix }}
+
+  manifest:
+    if: github.repository == 'bravo68web/lodestone'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+      - name: choose tags
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            STABLE="${{ inputs.stable }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+            if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+              STABLE="false"
+            else
+              STABLE="true"
+            fi
+          fi
+          TAGS="${IMAGE}:${VERSION}"
+          if [ "$STABLE" = "true" ]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"$'\n'"${IMAGE}:latest-stable"
+          else
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest-beta"
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: publish multi-arch manifest
+        run: |
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            docker buildx imagetools create -t "$tag" \
+              "${IMAGE}:${{ steps.tags.outputs.version }}-amd64" \
+              "${IMAGE}:${{ steps.tags.outputs.version }}-arm64"
+          done <<< "${{ steps.tags.outputs.tags }}"

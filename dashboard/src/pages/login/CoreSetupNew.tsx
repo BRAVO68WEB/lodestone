@@ -1,7 +1,7 @@
 import axios from 'axios';
 import Button from 'components/Atoms/Button';
 import { useContext, useEffect, useState } from 'react';
-import { DISABLE_AUTOFILL, errorToString } from 'utils/util';
+import { coreLabel, coreSocket, DISABLE_AUTOFILL, errorToString } from 'utils/util';
 import { LodestoneContext } from 'data/LodestoneContext';
 import InputField from 'components/Atoms/Form/InputField';
 import { Form, Formik, FormikHelpers } from 'formik';
@@ -43,10 +43,9 @@ const CoreSetupNew = () => {
   const { setToken, core } = useContext(LodestoneContext);
   const queryClient = useQueryClient();
   const [setupKey, setSetupKey] = useState<string>('');
-  const { address, port } = core;
   const { core_name } = coreInfo ?? {};
   const tauri = useTauri();
-  const socket = `${address}:${port}`;
+  const socket = coreSocket(core);
   const keyPrefilled = !!(tauri && setupKey);
   const gaEventTracker = useAnalyticsEventTracker('Core Setup Page');
 
@@ -113,7 +112,7 @@ const CoreSetupNew = () => {
           Create an owner&#39;s account
         </h1>
         <h2 className="text-medium font-medium tracking-medium text-white/50">
-          {core_name} ({socket})
+          {core_name} ({coreLabel(core)})
         </h2>
         {keyPrefilled ? null : (
           <h2 className="text-medium font-medium tracking-medium text-white/50">

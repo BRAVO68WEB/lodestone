@@ -82,21 +82,11 @@ export const useCoreInfo = (refetchInterval: number | false = false) => {
   );
 };
 
-// this should only be used to check if the core is setup or not
-// it refetches frequently to check if any new core shows up
-export const useLocalCoreInfo = () => {
-  //change to https when we default to it in core
-  return useQuery<CoreInfo, AxiosError>(
-    ['systeminfo', 'LocalCoreInfo'],
-    () =>
-      axios
-        .get<CoreInfo>(`/info`, {
-          baseURL: `http://localhost:${LODESTONE_PORT}/api/v1`,
-          timeout: 3000,
-        })
-        .then((res) => res.data),
-    {
-      refetchInterval: 3000,
-    }
-  );
-};
+/** One-shot probe of a core on this computer. Does not change the active core. */
+export async function fetchLocalCoreInfo(): Promise<CoreInfo> {
+  const response = await axios.get<CoreInfo>(`/info`, {
+    baseURL: `http://localhost:${LODESTONE_PORT}/api/v1`,
+    timeout: 3000,
+  });
+  return response.data;
+}

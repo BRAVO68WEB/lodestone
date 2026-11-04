@@ -1,7 +1,14 @@
 import axios from 'axios';
 import Button from 'components/Atoms/Button';
 import { useContext } from 'react';
-import { DISABLE_AUTOFILL, errorToString, LODESTONE_PORT } from 'utils/util';
+import {
+  DEFAULT_LOCAL_CORE,
+  DISABLE_AUTOFILL,
+  errorToString,
+  LODESTONE_PORT,
+  parseCoreInput,
+  coreApiBase,
+} from 'utils/util';
 import { CoreConnectionInfo, LodestoneContext } from 'data/LodestoneContext';
 import InputField from 'components/Atoms/Form/InputField';
 import { Form, Formik, FormikHelpers } from 'formik';
@@ -13,7 +20,7 @@ import {
   faDownload,
 } from '@fortawesome/free-solid-svg-icons';
 import { BrowserLocationContext } from 'data/BrowserLocationContext';
-import { CoreInfo } from 'data/SystemInfo';
+import { CoreInfo, fetchLocalCoreInfo } from 'data/SystemInfo';
 import { useDocumentTitle } from 'usehooks-ts';
 import WarningAlert from 'components/Atoms/WarningAlert';
 import { useEffect, useState } from 'react';
@@ -33,6 +40,9 @@ const CoreConnect = () => {
   const { setCore, addCore } = useContext(LodestoneContext);
   const [ShowBlurb, setShowBlurb] = useState(false);
   const [showPopup, setShowPopup] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+  const [detectError, setDetectError] = useState('');
+  const [detectedLocal, setDetectedLocal] = useState<CoreInfo | null>(null);
 
   const initialValues: CoreConnectionInfo = {
     address: '',
@@ -52,15 +62,23 @@ const CoreConnect = () => {
     ) {
       values.address = `[${values.address}]`;
     }
+    let core: CoreConnectionInfo;
+    try {
+      core = parseCoreInput(values.address, values);
+    } catch {
+      actions.setStatus({ error: 'Enter a host or a full http(s) URL' });
+      actions.setSubmitting(false);
+      return;
+    }
     axios
       .get<CoreInfo>(`/info`, {
-        baseURL: `${values.protocol}://${values.address}:${values.port}/api/${values.apiVersion}`,
+        baseURL: coreApiBase(core),
       })
       .then((res) => {
         if (res.status !== 200)
           throw new Error('Invalid response, setup may be invalid');
-        setCore(values);
-        addCore(values);
+        setCore(core);
+        addCore(core);
         if (res.data.is_setup === false) {
           setPathname('/login/core/first_setup');
         } else {
@@ -71,7 +89,10 @@ const CoreConnect = () => {
       })
       .catch((err) => {
         const errorMessages = errorToString(err);
-        actions.setStatus({ error: errorMessages });
+        const protocolLabel = core.protocol === 'https' ? 'HTTPS' : 'HTTP';
+        actions.setStatus({
+          error: `${protocolLabel} request failed: ${errorMessages}`,
+        });
         actions.setSubmitting(false);
         return;
       });
@@ -94,7 +115,7 @@ const CoreConnect = () => {
   }, []);
 
   return (
-    <div className="flex w-[768px] max-w-full flex-col items-stretch justify-center gap-12 rounded-2xl px-12 py-14 @container">
+    <div className="mx-auto flex w-full max-w-[768px] flex-col items-stretch justify-center gap-8 rounded-2xl px-4 py-8 @container sm:gap-12 sm:px-12 sm:py-14">
       {showPopup && (
         <ConfirmDialog
           isOpen={ShowBlurb}
@@ -142,7 +163,7 @@ const CoreConnect = () => {
         validateOnBlur={false}
         validateOnChange={false}
       >
-        {({ isSubmitting, status }) => (
+        {({ isSubmitting, status, values }) => (
           <Form
             id="addCoreForm"
             className="flex flex-col gap-12"
@@ -174,17 +195,59 @@ const CoreConnect = () => {
                 type="text"
                 name="address"
                 label="IP Address/Domain"
-                placeholder='e.g. 123.123.123.123 or "myserver.com"'
+                placeholder="e.g. 123.123.123.123, myserver.com, or https://core.example.com:16662"
               />
             </div>
-            <div className="flex w-full flex-row justify-between gap-4">
+            <div className="flex flex-col items-start gap-2">
+              <Button
+                type="button"
+                label={detecting ? 'Looking for a local core' : 'Detect local core'}
+                disabled={detecting}
+                onClick={() => {
+                  setDetectError('');
+                  setDetecting(true);
+                  fetchLocalCoreInfo()
+                    .then((info) => setDetectedLocal(info))
+                    .catch((err) => setDetectError(errorToString(err)))
+                    .finally(() => setDetecting(false));
+                }}
+              />
+              {detectError && (
+                <p className="text-small font-medium text-red-200">
+                  No core on localhost:{LODESTONE_PORT}. {detectError}
+                </p>
+              )}
+            </div>
+            <ConfirmDialog
+              isOpen={detectedLocal !== null}
+              title="Use the core on this computer?"
+              type="info"
+              confirmButtonText="Use local core"
+              closeButtonText="Cancel"
+              onConfirm={() => {
+                const local = { ...DEFAULT_LOCAL_CORE };
+                setCore(local);
+                addCore(local);
+                setDetectedLocal(null);
+                if (detectedLocal?.is_setup === false) {
+                  setPathname('/login/core/first_setup');
+                } else {
+                  setPathname('/login/user/select');
+                }
+              }}
+              onClose={() => setDetectedLocal(null)}
+            >
+              Found {detectedLocal?.core_name ?? 'a core'} at localhost:
+              {LODESTONE_PORT}. This replaces the address in the form.
+            </ConfirmDialog>
+            <div className="flex w-full flex-col gap-3 sm:flex-row sm:justify-between">
               <Button
                 type="button"
                 icon={faArrowLeft}
                 label="Back"
                 onClick={navigateBack}
               />
-              <div className="flex flex-row gap-4">
+              <div className="flex flex-col gap-3 sm:flex-row">
                 <Button
                   type="button"
                   iconRight={faDownload}
@@ -202,7 +265,13 @@ const CoreConnect = () => {
                   label="Add and Continue"
                   iconRight={faArrowRight}
                   loading={isSubmitting} //TODO: fix button size changing when loading
-                  onClick={() => setShowPopup(true)}
+                  onClick={() => {
+                    const address = values.address.trim();
+                    const https =
+                      values.protocol === 'https' ||
+                      /^https:\/\//i.test(address);
+                    if (!https) setShowPopup(true);
+                  }}
                 />
               </div>
             </div>
